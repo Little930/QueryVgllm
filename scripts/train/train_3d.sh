@@ -11,10 +11,10 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct/"  # [ModelArguments] Pretrained model path
+MODEL_PATH="/public_datasets/VG-LLM/weights/Qwen2.5-VL-2B-Instruct"
 GEOMETRY_ENCODER_TYPE="vggt"
-GEOMETRY_ENCODER_PATH="facebook/VGGT-1B"
-OUTPUT_DIR="PATH_TO_OUTPUT_DIR"                   # Directory for saving checkpoints
+GEOMETRY_ENCODER_PATH="/public_datasets/VG-LLM/weights/VGGT-1B"
+OUTPUT_DIR="./checkpoints/vgllm_3d_run1"                # Directory for saving checkpoints
 CACHE_DIR="./cache"                        # [TrainingArguments] Cache directory for models
 mkdir -p $OUTPUT_DIR
 

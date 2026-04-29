@@ -1,4 +1,6 @@
 *cpython-310*
 *__pycache__
 *egg-info
-data
+data/
+weights/
+checkpoints/
