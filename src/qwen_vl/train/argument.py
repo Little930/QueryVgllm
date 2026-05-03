@@ -19,6 +19,32 @@ class ModelArguments:
     fusion_num_layers: int = field(default=1)  # Number of layers in the cross-attention module when feature_fusion_method is "cross_attention"
     geometry_merger_type: str = field(default="mlp")  # Type of geometry feature merger ("mlp", "avg")
 
+    # =====================================================
+    # 3DRS Integration: Distillation, Grounding, Query Token
+    # =====================================================
+    # Grounding head configuration
+    ground_head_type: Optional[str] = field(default=None, metadata={"help": "Grounding head type: None, 'infonce', 'mlp', 'score'"})
+    ground_head_temperature: float = field(default=0.07, metadata={"help": "Temperature for InfoNCE grounding loss"})
+
+    # Query token configuration  
+    query_type: Optional[str] = field(default=None, metadata={"help": "Query token type: None, 'geometry', 'geometry,depth', 'blank', 'blank,reason'"})
+    query_size: int = field(default=4, metadata={"help": "Number of query tokens per frame"})
+    query_image: bool = field(default=False, metadata={"help": "Whether to also apply distillation on image tokens"})
+
+    # Object feature aggregation
+    obj_feature: Optional[str] = field(default=None, metadata={"help": "Object feature aggregation: None, 'sim', 'center_sim', 'filter'"})
+
+    # 3D position encoding (applied to visual tokens using world coordinates)
+    world_position_embedding_type: Optional[str] = field(default=None, metadata={"help": "World PE type: None, 'avg-sin3d', 'avg-discrete-sin3d', 'avg-mlp', etc."})
+    voxel_size: float = field(default=0.1, metadata={"help": "Voxel size for discretization when using discrete world PE"})
+
+    # Distillation configuration
+    distillation_mode: str = field(default="offline", metadata={"help": "Distillation target source: 'offline' (precomputed features) or 'online' (from geometry_encoder)"})
+    distillation_feature_dim: int = field(default=2048, metadata={"help": "Dimension of VGGT distillation target features"})
+    distillation_depth_feature_dim: int = field(default=1024, metadata={"help": "Dimension of depth distillation target features (e.g. DAv2)"})
+    distillation_loss_weight: float = field(default=1.0, metadata={"help": "Weight for 3D feature distillation loss"})
+    grounding_loss_weight: float = field(default=1.0, metadata={"help": "Weight for grounding loss"})
+
 @dataclass
 class DataArguments:
     dataset_use: str = field(default="")

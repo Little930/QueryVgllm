@@ -611,6 +611,19 @@ class DataCollatorForSupervisedDataset(object):
             batch["geometry_encoder_inputs"] = geometry_encoder_inputs
             assert len(set([instance["tag"] for instance in instances])) == 1, "all data in a batch should have the same tag"
             batch["tag"] = instances[0]["tag"]
+
+        # 3DRS: Collate video_dict for 3D tasks
+        if "video_dict" in instances[0] and instances[0]["video_dict"] is not None:
+            from .data_3d import merge_video_dict
+            video_dicts = [inst["video_dict"] for inst in instances if inst.get("video_dict") is not None]
+            if video_dicts:
+                batch["video_dict"] = merge_video_dict(video_dicts)
+        
+        # 3DRS: Pass through grounding-related fields
+        for key in ["use_object_proposals", "box_labels", "img_pos_list", "img_length_list", "object_features"]:
+            if key in instances[0]:
+                batch[key] = [inst.get(key) for inst in instances]
+
         return batch
 
 

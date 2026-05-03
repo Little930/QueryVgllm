@@ -11,7 +11,7 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="/public_datasets/VG-LLM/weights/Qwen2.5-VL-2B-Instruct"
+MODEL_PATH="/public_datasets/VG-LLM/weights/Qwen2.5-VL-3B-Instruct"
 GEOMETRY_ENCODER_TYPE="vggt"
 GEOMETRY_ENCODER_PATH="/public_datasets/VG-LLM/weights/VGGT-1B"
 OUTPUT_DIR="./checkpoints/vgllm_3d_run1"                # Directory for saving checkpoints
@@ -76,3 +76,31 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --geometry_encoder_path $GEOMETRY_ENCODER_PATH \
             --feature_fusion_method "add" \
             > ${OUTPUT_DIR}/train.log 2>&1
+
+# ===================================================
+# 3DRS Optional Parameters (uncomment to enable)
+# ===================================================
+# Add these to the torchrun command above (before the redirect) to enable 3DRS features:
+#
+# --- Grounding Head ---
+# --ground_head_type "infonce"            # Options: None, "infonce", "mlp", "score"
+# --ground_head_temperature 0.07          # Temperature for InfoNCE loss
+#
+# --- Query Token Distillation ---
+# --query_type "geometry"                 # Options: None, "geometry", "geometry,depth", "blank", "blank,reason"
+# --query_size 4                          # Number of query tokens per frame
+# --query_image False                     # Also distill on image tokens (dual distillation)
+#
+# --- Object Feature Aggregation ---
+# --obj_feature None                      # Options: None, "sim", "center_sim", "filter"
+#
+# --- 3D World Position Encoding ---
+# --world_position_embedding_type None    # Options: None, "avg-discrete-sin3d", "avg-sin3d", "avg-mlp"
+# --voxel_size 0.1                        # Voxel size for discretization
+#
+# --- Distillation Configuration ---
+# --distillation_mode "offline"           # Options: "offline" (precomputed features), "online" (from geometry_encoder)
+# --distillation_feature_dim 2048         # VGGT feature dimension
+# --distillation_depth_feature_dim 1024   # DAv2 feature dimension
+# --distillation_loss_weight 1.0          # Weight for distillation loss
+# --grounding_loss_weight 1.0             # Weight for grounding loss

@@ -1582,7 +1582,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         super().__init__(config)
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
         
-        # Initialize geometry encoder if enabled
+        # Initialize geometry encoder if enabled (existing feature)
         if getattr(config, 'use_geometry_encoder', False):
             self._init_geometry_encoder(config)
         
@@ -1591,9 +1591,156 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.rope_deltas = None  # cache rope_deltas here
 
+        # =====================================================
+        # 3DRS Integration: Distillation, Grounding, Query Token
+        # =====================================================
+        self._init_3drs_components(config)
+
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _init_3drs_components(self, config):
+        """Initialize 3DRS components: distillation projectors, query tokens,
+        grounding head, and world position encoding.
+        
+        All components are gated by config flags. When flags are None/False/default,
+        nothing is initialized and existing behavior is preserved.
+        """
+        hidden_size = config.hidden_size
+
+        # --- Query Token & Distillation Configuration ---
+        self.query_type = getattr(config, "query_type", None)
+        self.query_size = getattr(config, "query_size", 4)
+        self.obj_feature = getattr(config, "obj_feature", None)
+        self.query_image = getattr(config, "query_image", False)
+        self.distillation_mode = getattr(config, "distillation_mode", "offline")
+        self.distillation_loss_weight = getattr(config, "distillation_loss_weight", 1.0)
+        self.grounding_loss_weight = getattr(config, "grounding_loss_weight", 1.0)
+
+        # Learnable query tokens (initialized only when query_type is set)
+        self.geometry_query = None
+        self.depth_query = None
+        self.blank_query = None
+        self.reason_query = None
+
+        distill_feat_dim = getattr(config, "distillation_feature_dim", 2048)
+        distill_depth_dim = getattr(config, "distillation_depth_feature_dim", 1024)
+
+        # Number of frames — dynamic in Qwen2.5-VL, but query tokens need a fixed count
+        # This will be set at runtime from video_dict; default 32 for offline mode
+        self._default_num_frames = 32
+
+        # Distillation projector: maps LLM hidden states → teacher feature space
+        if self.query_type is None or self.query_image:
+            # proj_3d is for image-token-level distillation (legacy / query_image mode)
+            self.proj_3d = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 2),
+                nn.GELU(),
+                nn.Linear(hidden_size * 2, distill_feat_dim)
+            )
+
+        if self.query_type and 'blank' in self.query_type:
+            self.blank_query = nn.Parameter(
+                torch.zeros(self._default_num_frames * self.query_size, hidden_size)
+            )
+            # blank_query stays zero-init: control group (no distillation signal)
+
+        if self.query_type and 'reason' in self.query_type:
+            self.reason_query = nn.Parameter(
+                torch.zeros(self.query_size, hidden_size)
+            )
+            torch.nn.init.normal_(self.reason_query, mean=0.0, std=0.02)
+
+        if self.query_type and 'geometry' in self.query_type:
+            self.proj_geometry = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 2),
+                nn.GELU(),
+                nn.Linear(hidden_size * 2, distill_feat_dim)
+            )
+            self.geometry_query = nn.Parameter(
+                torch.zeros(self._default_num_frames * self.query_size, hidden_size)
+            )
+            torch.nn.init.normal_(self.geometry_query, mean=0.0, std=0.02)
+
+        if self.query_type and 'depth' in self.query_type:
+            self.proj_depth = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 2),
+                nn.GELU(),
+                nn.Linear(hidden_size * 2, distill_depth_dim)
+            )
+            self.depth_query = nn.Parameter(
+                torch.zeros(self._default_num_frames * self.query_size, hidden_size)
+            )
+            torch.nn.init.normal_(self.depth_query, mean=0.0, std=0.02)
+
+        # --- Grounding Head ---
+        ground_head_type = getattr(config, "ground_head_type", None)
+        self.ground_head_type = ground_head_type
+
+        if ground_head_type is not None:
+            if ground_head_type == "mlp":
+                self.ground_head = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.ReLU(),
+                    nn.LayerNorm(hidden_size),
+                    nn.Linear(hidden_size, hidden_size)
+                )
+            elif ground_head_type == "infonce":
+                self.ground_head_temperature = getattr(config, "ground_head_temperature", 0.07)
+                self.ground_head_zero_target = nn.Parameter(torch.randn(hidden_size))
+                self.ground_head_obj = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.ReLU(),
+                    nn.LayerNorm(hidden_size),
+                    nn.Linear(hidden_size, hidden_size),
+                )
+                self.ground_head_query = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.ReLU(),
+                    nn.LayerNorm(hidden_size),
+                    nn.Linear(hidden_size, hidden_size),
+                )
+            elif ground_head_type == "score":
+                self.ground_head_temperature = getattr(config, "ground_head_temperature", 0.07)
+                self.ground_head_obj = nn.Sequential(
+                    nn.Linear(hidden_size, 1024),
+                    nn.LayerNorm(1024),
+                    nn.ReLU(),
+                    nn.Linear(1024, 1024),
+                )
+                self.ground_head_query = nn.Sequential(
+                    nn.Linear(hidden_size, 1024),
+                    nn.LayerNorm(1024),
+                    nn.ReLU(),
+                    nn.Linear(1024, 1024),
+                )
+                self.ground_head_score = nn.Sequential(
+                    nn.Linear(1024, 1024),
+                    nn.LayerNorm(1024),
+                    nn.ReLU(),
+                    nn.Linear(1024, 1),
+                )
+
+        # --- World Position Encoding ---
+        world_pe_type = getattr(config, "world_position_embedding_type", None)
+        if world_pe_type is not None:
+            from .position_encoding import PositionEmbeddingSine3D, PositionEmbeddingMLP
+            
+            if "sample9" in world_pe_type:
+                n_points = 9
+            elif "sample5" in world_pe_type:
+                n_points = 5
+            elif "minmax" in world_pe_type:
+                n_points = 2
+            else:
+                n_points = 1
+
+            if "mlp" in world_pe_type:
+                self.world_position_embedding = PositionEmbeddingMLP(hidden_size, n_points=n_points)
+            elif "sin3d" in world_pe_type:
+                self.world_position_embedding = PositionEmbeddingSine3D(hidden_size, n_points=n_points)
     
+
     def _init_geometry_encoder(self, config):
         """Initialize geometry encoder and related modules."""
         # Create geometry encoder configuration
@@ -1652,6 +1799,384 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
         
         return image_embeds
+
+    # =================================================================
+    # 3DRS Methods: Feature Distillation, Grounding, Object Extraction
+    # =================================================================
+
+    def process_feature(self, foundation_model_feature, hidden_states, start_pos, length, target_size=None, use_query=True):
+        """Universal feature preprocessing for distillation.
+        
+        Reshapes teacher features to target spatial resolution and extracts
+        corresponding student features from hidden_states.
+        
+        Args:
+            foundation_model_feature: Teacher features [S, L, D]
+            hidden_states: LLM hidden states [B, seq_len, C]
+            start_pos: Start position in sequence
+            length: Length of the feature region
+            target_size: Target tokens per frame (default: self.query_size)
+            use_query: If True, extract from query tokens; if False, from image tokens
+        """
+        foundation_model_feature = foundation_model_feature.to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        S, L, D = foundation_model_feature.shape
+        C = hidden_states.shape[-1]
+        if target_size is None:
+            target_size = self.query_size
+
+        # Reshape foundation_model_feature based on spatial resolution L
+        if L == 196:
+            foundation_model_feature = foundation_model_feature.view(S, 14, 14, D).permute(0, 3, 1, 2).contiguous()
+        elif L == 256:
+            foundation_model_feature = foundation_model_feature.view(S, 16, 16, D).permute(0, 3, 1, 2).contiguous()
+        elif L == 768:
+            foundation_model_feature = foundation_model_feature.view(S, 24, 32, D).permute(0, 3, 1, 2).contiguous()
+        elif L == 1036:
+            foundation_model_feature = foundation_model_feature.view(S, 28, 37, D).permute(0, 3, 1, 2).contiguous()
+        elif L == 4096:
+            foundation_model_feature = foundation_model_feature.view(S, 64, 64, D).permute(0, 3, 1, 2).contiguous()
+        else:
+            # Fallback: try to find reasonable h, w
+            h = int(L ** 0.5)
+            w = L // h
+            if h * w == L:
+                foundation_model_feature = foundation_model_feature.view(S, h, w, D).permute(0, 3, 1, 2).contiguous()
+            else:
+                raise NotImplementedError(f"Unsupported feature spatial size L={L}")
+
+        if use_query:
+            if L == S * target_size:
+                foundation_model_feature = foundation_model_feature.view(S, D, target_size).permute(0, 2, 1).contiguous().view(S * target_size, D)
+            else:
+                if target_size == 4:
+                    pool_h, pool_w = 2, 2
+                elif target_size == 16:
+                    pool_h, pool_w = 4, 4
+                elif target_size == 196:
+                    pool_h, pool_w = 14, 14
+                else:
+                    pool_h = pool_w = int(target_size ** 0.5)
+                foundation_model_feature = F.adaptive_avg_pool2d(foundation_model_feature, (pool_h, pool_w))
+                foundation_model_feature = foundation_model_feature.view(S, D, target_size).permute(0, 2, 1).contiguous().view(S * target_size, D)
+
+            query_feature = hidden_states[:, start_pos:start_pos + S * target_size, :].contiguous().view(S * target_size, C)
+        else:
+            # Image token mode: pool teacher to match image token grid
+            foundation_model_feature = F.adaptive_avg_pool2d(foundation_model_feature, (14, 14))
+            foundation_model_feature = foundation_model_feature.view(S, D, 196).permute(0, 2, 1).contiguous().view(S * 196, D)
+            # Extract image token features (handle newline token in Qwen2.5-VL grid)
+            raw_feat = hidden_states[:, start_pos:start_pos + length, :]
+            # Try to reshape; if total length doesn't match S*14*15, use adaptive reshape
+            total_tokens = raw_feat.shape[1]
+            if total_tokens == S * (14 * 15):
+                # LLaVA-style: 14 cols + 1 newline per row per frame
+                query_feature = raw_feat.view(S, 14, 15, C)[:, :, :-1, :].contiguous().view(S * 196, C)
+            else:
+                # Qwen2.5-VL dynamic grid: flatten directly
+                query_feature = raw_feat.contiguous().view(-1, C)
+                # Adaptive pool to match foundation_model_feature size
+                if query_feature.shape[0] != foundation_model_feature.shape[0]:
+                    query_feature = query_feature[:foundation_model_feature.shape[0]]
+
+        return foundation_model_feature, query_feature
+
+    def calculate_feature_loss(self, foundation_model_feature, feature):
+        """Compute normalized L2 distillation loss.
+        
+        Both features are L2-normalized before computing MSE.
+        Teacher features are detached (no gradient).
+        """
+        feature_norm = feature / feature.norm(dim=-1, p=2, keepdim=True).clamp(min=1e-8)
+        fm_norm = foundation_model_feature / foundation_model_feature.norm(dim=-1, p=2, keepdim=True).clamp(min=1e-8)
+        feature_sim = ((feature_norm - fm_norm.detach()) ** 2).sum(dim=-1)
+        return feature_sim.mean()
+
+    def feature_3d_alignment(self, video_dict, hidden_states, img_pos_list=None, img_length_list=None):
+        """Router for 3D feature distillation loss.
+        
+        Dispatches to appropriate distillation path based on self.query_type:
+        - None: distill on image tokens (legacy mode)
+        - 'blank': return zero loss (control group)
+        - 'geometry': distill on geometry query tokens using VGGT features
+        - 'depth': additionally distill on depth query tokens using DAv2 features
+        """
+        if self.query_type and 'blank' in self.query_type:
+            return torch.tensor(0.0).to(hidden_states.device, dtype=hidden_states.dtype)
+
+        C = hidden_states.shape[-1]
+        feature_3d = video_dict.get('feature_3d', None)
+        if feature_3d is None:
+            return torch.tensor(0.0).to(hidden_states.device, dtype=hidden_states.dtype)
+        feature_3d = feature_3d.squeeze()
+        if feature_3d.dim() == 2:
+            feature_3d = feature_3d.unsqueeze(0)
+
+        feature_sim_loss = torch.tensor(0.0).to(hidden_states.device, dtype=hidden_states.dtype)
+
+        if self.query_type is not None:
+            geometry_query_pos = img_pos_list[0] + img_length_list[0]
+
+            if 'geometry' in self.query_type:
+                S = feature_3d.shape[0]
+                processed_feature_3d, feature_geometry = self.process_feature(
+                    feature_3d, hidden_states, geometry_query_pos,
+                    S * self.query_size, self.query_size
+                )
+                feature_geometry = self.proj_geometry(feature_geometry)
+                feature_sim_loss = self.calculate_feature_loss(processed_feature_3d, feature_geometry)
+
+                if self.query_image:
+                    processed_feature_3d_img, feature_image = self.process_feature(
+                        feature_3d, hidden_states, img_pos_list[0],
+                        img_length_list[0], use_query=False
+                    )
+                    feature_image = self.proj_3d(feature_image)
+                    feature_sim_loss = feature_sim_loss + self.calculate_feature_loss(
+                        processed_feature_3d_img, feature_image
+                    )
+
+            if 'depth' in self.query_type:
+                feature_dav2 = video_dict.get('feature_dav2', None)
+                if feature_dav2 is not None:
+                    feature_dav2 = feature_dav2.squeeze()
+                    if feature_dav2.dim() == 2:
+                        feature_dav2 = feature_dav2.unsqueeze(0)
+                    S = feature_dav2.shape[0]
+                    depth_query_pos = geometry_query_pos + S * self.query_size if 'geometry' in self.query_type else geometry_query_pos
+                    processed_feature_dav2, feature_depth = self.process_feature(
+                        feature_dav2, hidden_states, depth_query_pos,
+                        S * self.query_size, self.query_size
+                    )
+                    feature_depth = self.proj_depth(feature_depth)
+                    feature_depth_loss = self.calculate_feature_loss(processed_feature_dav2, feature_depth)
+                    feature_sim_loss = feature_sim_loss + feature_depth_loss * 0.5
+        else:
+            # Legacy mode: distill directly on image tokens
+            processed_feature_3d, feature = self.process_feature(
+                feature_3d, hidden_states, img_pos_list[0],
+                img_length_list[0], use_query=False
+            )
+            feature_proj = self.proj_3d(feature)
+            feature_sim_loss = self.calculate_feature_loss(processed_feature_3d, feature_proj)
+
+        return feature_sim_loss * self.distillation_loss_weight
+
+    def extract_object_feature(self, video_dict, hidden_states, img_pos_list=None, img_length_list=None):
+        """Extract object features from LLM hidden states based on 3D bounding boxes.
+        
+        Uses world coordinates to determine which visual patches fall within each 
+        object's 3D bounding box, then aggregates features accordingly.
+        
+        Args:
+            video_dict: Dict with 'objects' (Nx6 boxes) and 'world_coords'
+            hidden_states: LLM hidden states
+            img_pos_list: Start positions of image tokens
+            img_length_list: Lengths of image token regions
+        """
+        object_boxes = video_dict["objects"][0]
+        obj_num = len(object_boxes)
+        world_coords = video_dict["world_coords"][0]
+        C = hidden_states.shape[-1]
+
+        # Extract image features from hidden states
+        image_features = hidden_states[:, img_pos_list[0]:img_pos_list[0] + img_length_list[0], :]
+        total_tokens = image_features.shape[1]
+        
+        # Try to determine frame count and spatial layout
+        num_frames = video_dict.get('num_frames', self._default_num_frames)
+        tokens_per_frame = total_tokens // num_frames
+        
+        # Determine patch layout for object-patch matching
+        # This uses the world coordinate grid for spatial correspondence
+        V, H, W, D = world_coords.size()
+        patch_size = 27  # SigLip default; will be overridden for Qwen2.5-VL
+        patch_h = (H - 6) // patch_size if H > patch_size else H
+        patch_w = (W - 6) // patch_size if W > patch_size else W
+
+        object_features = []
+        for l in range(obj_num):
+            box = object_boxes[l]
+            min_xyz = box[:3] - box[3:] / 2
+            max_xyz = box[:3] + box[3:] / 2
+
+            # Compute patch-level masks using world coordinates
+            if H > patch_size:
+                world_coords_crop = world_coords[:, :patch_h * patch_size, :patch_w * patch_size, :]
+                wc_reshaped = world_coords_crop.reshape(V, patch_h, patch_size, patch_w, patch_size, 3)
+                wc_reshaped = wc_reshaped.transpose(2, 3).flatten(3, 4)
+                cur_object_patch = torch.all((min_xyz <= wc_reshaped) & (wc_reshaped <= max_xyz), dim=-1)
+                cur_object_patch = cur_object_patch.sum(dim=3) >= int(patch_size * patch_size * 0.125)
+            else:
+                # Simplified: use averaged coordinates
+                cur_object_patch = torch.all((min_xyz <= world_coords) & (world_coords <= max_xyz), dim=-1)
+
+            if self.obj_feature is not None:
+                # Multi-view weighted aggregation
+                feature_per_view = []
+                img_feat_views = image_features.view(1, num_frames, tokens_per_frame, C).squeeze(0)
+                patch_mask = cur_object_patch.view(num_frames, -1)
+
+                for v_idx in range(min(num_frames, V)):
+                    if v_idx < patch_mask.shape[0] and v_idx < img_feat_views.shape[0]:
+                        valid_mask = patch_mask[v_idx][:tokens_per_frame]
+                        if valid_mask.sum() > 0:
+                            feat = img_feat_views[v_idx][valid_mask]
+                            feature_per_view.append(feat.mean(dim=0))
+
+                if len(feature_per_view) == 0:
+                    cur_obj_feat = torch.zeros(C, device=hidden_states.device, dtype=hidden_states.dtype)
+                elif len(feature_per_view) == 1:
+                    cur_obj_feat = feature_per_view[0]
+                else:
+                    feature_per_view = torch.stack(feature_per_view, dim=0)
+                    norm_fpv = F.normalize(feature_per_view, dim=1)
+
+                    if self.obj_feature == 'center_sim':
+                        center = F.normalize(norm_fpv.mean(dim=0), dim=0)
+                        sim = torch.matmul(norm_fpv, center)
+                        weights = F.softmax(sim * 10, dim=0)
+                        cur_obj_feat = (weights[:, None] * feature_per_view).sum(dim=0)
+                    elif self.obj_feature == 'sim':
+                        feat_sum = norm_fpv.sum(dim=0, keepdim=True)
+                        sim_sum = (norm_fpv * feat_sum).sum(dim=1)
+                        sim_avg = (sim_sum - 1) / max(norm_fpv.size(0) - 1, 1)
+                        weights = F.softmax(sim_avg * 10, dim=0)
+                        cur_obj_feat = (weights[:, None] * feature_per_view).sum(dim=0)
+                    elif self.obj_feature == 'filter':
+                        sim_matrix = torch.matmul(norm_fpv, norm_fpv.T)
+                        sim_matrix = sim_matrix - torch.eye(sim_matrix.size(0), device=sim_matrix.device)
+                        sim_matrix = sim_matrix.sum(dim=0) / max(len(sim_matrix) - 1, 1)
+                        weights = F.softmax(sim_matrix * 10, dim=0)
+                        valid_view = weights > 0.2 / len(feature_per_view)
+                        cur_obj_feat = feature_per_view[valid_view].mean(dim=0)
+                    else:
+                        cur_obj_feat = feature_per_view.mean(dim=0)
+            else:
+                # Simple global mean
+                flat_mask = cur_object_patch.view(-1)
+                flat_feat = image_features.view(-1, C)
+                if flat_mask.shape[0] > flat_feat.shape[0]:
+                    flat_mask = flat_mask[:flat_feat.shape[0]]
+                elif flat_mask.shape[0] < flat_feat.shape[0]:
+                    flat_feat = flat_feat[:flat_mask.shape[0]]
+                selected = flat_feat[flat_mask]
+                if len(selected) == 0:
+                    cur_obj_feat = torch.zeros(C, device=hidden_states.device, dtype=hidden_states.dtype)
+                else:
+                    cur_obj_feat = selected.mean(dim=0)
+
+            object_features.append(cur_obj_feat)
+
+        return torch.stack(object_features) if object_features else torch.zeros(0, C, device=hidden_states.device)
+
+    def predict_box(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+        video_dict=None,
+        object_features=None,
+        box_labels=None,
+        img_pos_list=None,
+        img_length_list=None,
+    ):
+        """Grounding branch: predict which object matches the ground token.
+        
+        Runs LLM forward, extracts ground token features, computes matching
+        scores with object features, and returns grounding loss.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        hidden_states = outputs[0]
+
+        # Extract ground token features
+        ground_token_ids = getattr(self.config, 'ground_token_ids', [])
+        if ground_token_ids and labels is not None:
+            ground_locations = (labels >= ground_token_ids[0]) & (labels <= ground_token_ids[-1])
+            ground_hidden = hidden_states[ground_locations].squeeze(1)
+        else:
+            ground_hidden = hidden_states[:, -1, :]  # fallback: last token
+
+        # Extract object features from LLM internal representations
+        object_features_llm = self.extract_object_feature(
+            video_dict, hidden_states,
+            img_pos_list=img_pos_list, img_length_list=img_length_list
+        )
+        # Combine CLIP-level features with LLM-level features
+        if object_features is not None:
+            object_features = (object_features + object_features_llm) / 2
+        else:
+            object_features = object_features_llm
+
+        # Compute matching scores
+        if self.ground_head_type == 'mlp':
+            ground_hidden = self.ground_head(ground_hidden).squeeze(0)
+            scores = (ground_hidden * object_features).sum(dim=-1)
+        elif self.ground_head_type == 'score':
+            obj_feat = self.ground_head_obj(object_features.to(ground_hidden.dtype))
+            query_feat = self.ground_head_query(ground_hidden)
+            mul_feat = obj_feat * query_feat
+            scores = self.ground_head_score(mul_feat).squeeze(1)
+        elif self.ground_head_type == 'infonce':
+            object_features = torch.cat([object_features, self.ground_head_zero_target.unsqueeze(0)], dim=0)
+            obj_feat = self.ground_head_obj(object_features.to(ground_hidden.dtype))
+            query_feat = self.ground_head_query(ground_hidden)
+            obj_feat = F.normalize(obj_feat)
+            query_feat = F.normalize(query_feat)
+            scores = (obj_feat * query_feat).sum(dim=-1)
+        else:
+            scores = torch.zeros(len(object_features), device=hidden_states.device)
+
+        # Compute loss
+        loss = None
+        if box_labels is not None:
+            if self.ground_head_type == "infonce":
+                if len(box_labels[0]) == 0:
+                    box_labels[0].append(-1)
+                logits = torch.exp(scores / self.ground_head_temperature)
+                loss = -torch.log(logits[box_labels[0]].sum() / logits.sum())
+            else:
+                bce_loss_fct = nn.BCEWithLogitsLoss(reduction='none')
+                target = torch.zeros_like(scores)
+                target[box_labels[0]] = 1
+                weight = torch.ones_like(scores)
+                if len(box_labels[0]) != 0:
+                    weight[box_labels[0]] *= (scores.shape[0] - len(box_labels[0])) / max(len(box_labels[0]), 1)
+                loss = (bce_loss_fct(scores, target.detach()) * weight).mean()
+
+            # Add distillation loss
+            if loss is not None:
+                distill_loss = self.feature_3d_alignment(
+                    video_dict, hidden_states,
+                    img_pos_list=img_pos_list, img_length_list=img_length_list
+                )
+                loss = loss * self.grounding_loss_weight + distill_loss
+
+        return loss, scores
 
 
     @classmethod
@@ -1882,6 +2407,13 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
+        # 3DRS parameters
+        video_dict: Optional[Dict] = None,
+        use_object_proposals: bool = False,
+        box_labels: Optional[List] = None,
+        img_pos_list: Optional[List[int]] = None,
+        img_length_list: Optional[List[int]] = None,
+        object_features: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -2020,6 +2552,40 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         )
 
         hidden_states = outputs[0]
+
+        # =====================================================
+        # 3DRS: Grounding branch dispatch
+        # =====================================================
+        if use_object_proposals and self.ground_head_type is not None and video_dict is not None:
+            grounding_loss, grounding_scores = self.predict_box(
+                input_ids=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                video_dict=video_dict,
+                object_features=object_features,
+                box_labels=box_labels,
+                img_pos_list=img_pos_list,
+                img_length_list=img_length_list,
+            )
+            # For grounding mode, return the grounding loss directly
+            logits = self.lm_head(hidden_states)
+            return Qwen2_5_VLCausalLMOutputWithPast(
+                loss=grounding_loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                rope_deltas=self.rope_deltas,
+            )
+
         logits = self.lm_head(hidden_states)
         loss = None
         if labels is not None:
@@ -2035,6 +2601,17 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+
+            # =====================================================
+            # 3DRS: Add standalone distillation loss (non-grounding mode)
+            # =====================================================
+            if video_dict is not None and img_pos_list is not None and img_length_list is not None:
+                distill_loss = self.feature_3d_alignment(
+                    video_dict, hidden_states,
+                    img_pos_list=img_pos_list, img_length_list=img_length_list
+                )
+                if distill_loss.item() > 0:
+                    loss = loss + distill_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]

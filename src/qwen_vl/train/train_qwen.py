@@ -95,6 +95,21 @@ def set_model(model_args, model):
         for n, p in model.geometry_encoder.named_parameters():
             p.requires_grad = False
 
+    # 3DRS: Ensure all 3DRS-added modules are always trainable
+    _3drs_module_prefixes = [
+        'proj_3d', 'proj_geometry', 'proj_depth',
+        'ground_head', 'ground_head_obj', 'ground_head_query', 
+        'ground_head_score', 'ground_head_zero_target',
+        'geometry_query', 'depth_query', 'blank_query', 'reason_query',
+        'world_position_embedding',
+        'geometry_merger', 'feature_fusion',
+    ]
+    for name, param in model.named_parameters():
+        for prefix in _3drs_module_prefixes:
+            if prefix in name:
+                param.requires_grad = True
+                break
+
 def train(attn_implementation="flash_attention_2"):
     global local_rank
 
@@ -132,7 +147,21 @@ def train(attn_implementation="flash_attention_2"):
                 "reference_frame",
                 "feature_fusion_method", 
                 "fusion_num_layers",
-                "geometry_merger_type"
+                "geometry_merger_type",
+                # 3DRS config keys
+                "ground_head_type",
+                "ground_head_temperature",
+                "query_type",
+                "query_size",
+                "query_image",
+                "obj_feature",
+                "world_position_embedding_type",
+                "voxel_size",
+                "distillation_mode",
+                "distillation_feature_dim",
+                "distillation_depth_feature_dim",
+                "distillation_loss_weight",
+                "grounding_loss_weight",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
