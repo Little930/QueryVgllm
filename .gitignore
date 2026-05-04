@@ -4,3 +4,7 @@
 data/
 weights/
 checkpoints/
+
+3DRS/
+*.whl
+
