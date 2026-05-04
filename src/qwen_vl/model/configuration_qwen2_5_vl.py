@@ -241,6 +241,34 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.rope_scaling = rope_scaling
 
+        # ── 3D Geometry Encoder (在线推理，原有) ────────────────────────────────
+        self.use_geometry_encoder = kwargs.pop("use_geometry_encoder", False)
+        self.geometry_encoder_type = kwargs.pop("geometry_encoder_type", "vggt")
+        self.geometry_encoder_path = kwargs.pop("geometry_encoder_path", None)
+        self.reference_frame = kwargs.pop("reference_frame", "first")
+        self.feature_fusion_method = kwargs.pop("feature_fusion_method", "add")
+        self.fusion_num_layers = kwargs.pop("fusion_num_layers", 1)
+        self.geometry_merger_type = kwargs.pop("geometry_merger_type", "mlp")
+        self.geometry_merger_hidden_dim = kwargs.pop("geometry_merger_hidden_dim", 4096)
+
+        # ── 3D Distillation (离线 npz，3DRS 迁移) ────────────────────────────────
+        # use_distillation=True: 启用离线 feature_3d/feature_dav2 → query token 蒸馏
+        # use_geometry_encoder 和 use_distillation 可独立开关，也可同时启用
+        self.use_distillation = kwargs.pop("use_distillation", False)
+        # query_type: None=image-token蒸馏(退化), 'blank'=控制组, 'geometry'=VGGT蒸馏,
+        #             'depth'=DAv2蒸馏, 'geometry,depth'=双教师
+        self.query_type = kwargs.pop("query_type", None)
+        # query_size: 每个图像/视频追加的 query token 数量（不依赖帧数）
+        self.query_size = kwargs.pop("query_size", 16)
+        # query_image: 在 query token 蒸馏基础上，是否同时对 image token 施加蒸馏损失
+        self.query_image = kwargs.pop("query_image", False)
+        # 投影头输出维度：geometry → VGGT 2048, depth → DAv2 1024
+        self.geometry_dim = kwargs.pop("geometry_dim", 2048)
+        self.depth_dim = kwargs.pop("depth_dim", 1024)
+        # 各路蒸馏损失权重
+        self.geometry_weight = kwargs.pop("geometry_weight", 1.0)
+        self.depth_weight = kwargs.pop("depth_weight", 0.5)   # 3DRS 硬编码为 0.5
+
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         # and change type from 'mrope' to 'default' because `mrope` does default RoPE calculations

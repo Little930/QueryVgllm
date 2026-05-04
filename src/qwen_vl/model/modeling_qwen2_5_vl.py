@@ -1581,11 +1581,16 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
     def __init__(self, config):
         super().__init__(config)
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
-        
-        # Initialize geometry encoder if enabled
+
+        # ── Path A: Online VGGT encode → FeatureFusion into image embedding (original) ──
         if getattr(config, 'use_geometry_encoder', False):
             self._init_geometry_encoder(config)
-        
+
+        # ── Path B: Offline npz → Query Token Distillation (3DRS-style, new) ──────────
+        # use_distillation and use_geometry_encoder are independent flags; both can be True.
+        if getattr(config, 'use_distillation', False):
+            self._init_distillation_modules(config)
+
         self.model = Qwen2_5_VLModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -1652,7 +1657,277 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             image_embeds = image_embeds.view(-1, image_embeds.shape[-1])
         
         return image_embeds
+    # ─────────────────────────────────────────────────────────────────────────
+    # 3DRS-style Distillation (Ported from 3DRS/llava/model/language_model/llava_qwen.py)
+    # Reference: 3DRS-1 → 3DRS 版本对比分析.md §2-§6
+    # ─────────────────────────────────────────────────────────────────────────
 
+    def _init_distillation_modules(self, config):
+        """Init query token params and projection heads. (3DRS §2.2)
+        Key diff vs 3DRS: query_size=total tokens per image (not 32*qs per video).
+        """
+        qt = getattr(config, 'query_type', None)
+        qs = getattr(config, 'query_size', 16)
+        H = config.hidden_size
+        self.geometry_query = None
+        self.depth_query = None
+        self.blank_query = None
+        self.proj_3d = None
+
+        def _proj(out_dim):
+            return nn.Sequential(nn.Linear(H, H * 2), nn.GELU(), nn.Linear(H * 2, out_dim))
+
+        # proj_3d: for image-token distillation (query_type=None) or query_image=True
+        if qt is None or getattr(config, 'query_image', False):
+            self.proj_3d = _proj(getattr(config, 'geometry_dim', 2048))
+
+        if qt and 'blank' in qt:
+            # Control group: adds capacity without distillation signal
+            self.blank_query = nn.Parameter(torch.zeros(qs, H))
+
+        if qt and 'geometry' in qt:
+            self.proj_geometry = _proj(getattr(config, 'geometry_dim', 2048))
+            self.geometry_query = nn.Parameter(torch.zeros(qs, H))
+            nn.init.normal_(self.geometry_query, mean=0.0, std=0.02)
+
+        if qt and 'depth' in qt:
+            self.proj_depth = _proj(getattr(config, 'depth_dim', 1024))
+            self.depth_query = nn.Parameter(torch.zeros(qs, H))
+            nn.init.normal_(self.depth_query, mean=0.0, std=0.02)
+
+    def process_feature_for_distillation(
+        self,
+        teacher_feat: torch.Tensor,   # (B,S,L,D) or (S,L,D)
+        hidden_states: torch.Tensor,  # (B,T,H)
+        token_mask: torch.Tensor,     # (B,T) bool
+        target_n: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reshape teacher features and extract student features. (3DRS §3.2 process_feature)"""
+        device, dtype = hidden_states.device, hidden_states.dtype
+        if teacher_feat.dim() == 3:
+            teacher_feat = teacher_feat.unsqueeze(0)
+        B, S, L, D = teacher_feat.shape
+        teacher_feat = teacher_feat.to(device=device, dtype=dtype)
+
+        # Determine spatial layout from L (3DRS §3.2 resolution dispatch)
+        _layouts = {4096: (64,64), 1036: (28,37), 768: (24,32), 256: (16,16), 196: (14,14)}
+        h, w = _layouts.get(L, (int(L**0.5), int(L**0.5)))
+
+        feat = teacher_feat.view(B*S, D, h, w)
+        if target_n is not None:
+            side = max(1, int(target_n**0.5))
+            feat = F.adaptive_avg_pool2d(feat, (side, side))
+        feat = feat.permute(0,2,3,1).reshape(-1, D)   # (B*S*spatial, D)
+
+        student = hidden_states[token_mask]             # (N, H)
+        return feat, student
+
+    def calculate_distillation_loss(
+        self, teacher: torch.Tensor, student: torch.Tensor
+    ) -> torch.Tensor:
+        """L2-norm pointwise MSE. (3DRS §3.2 calculate_feature_loss)
+        Gradients flow only to student; teacher is detached.
+        """
+        eps = 1e-8
+        s = student / student.norm(dim=-1, p=2, keepdim=True).clamp(min=eps)
+        t = teacher / teacher.norm(dim=-1, p=2, keepdim=True).clamp(min=eps)
+        return ((s - t.detach()) ** 2).sum(dim=-1).mean()
+
+    def compute_3d_distillation_loss(
+        self,
+        video_dict: dict,
+        hidden_states: torch.Tensor,
+        image_mask: torch.Tensor,
+        geo_query_mask: Optional[torch.Tensor] = None,
+        depth_query_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Routing function: compute total distillation loss. (3DRS §3.2 feature_3d_alignment)
+        Routing table:
+          query_type=None    → image-token distillation (3DRS-1 degenerate)
+          query_type='blank' → 0 loss (ablation control)
+          query_type='geometry' → geometry_query vs VGGT
+          query_type='depth'    → depth_query vs DAv2 (weight=depth_weight)
+          query_image=True      → additional image-token geometry loss
+        """
+        qt = getattr(self.config, 'query_type', None)
+        dev = hidden_states.device
+        loss = torch.tensor(0.0, device=dev)
+
+        # Blank: pure capacity ablation, no distillation
+        if qt and 'blank' in qt and 'geometry' not in qt and 'depth' not in qt:
+            return loss
+
+        feat3d = video_dict.get('feature_3d', None)
+
+        # ── Degenerate: image-token distillation (query_type=None) ──────────
+        if qt is None:
+            if feat3d is None or self.proj_3d is None:
+                return loss
+            try:
+                tf, sf = self.process_feature_for_distillation(feat3d, hidden_states, image_mask)
+                if tf.shape[0] == sf.shape[0] > 0:
+                    loss = self.calculate_distillation_loss(tf, self.proj_3d(sf))
+            except Exception:
+                pass
+            return loss
+
+        # ── Geometry query ───────────────────────────────────────────────────
+        if 'geometry' in qt and geo_query_mask is not None and feat3d is not None:
+            try:
+                qs = getattr(self.config, 'query_size', 16)
+                tf, sf = self.process_feature_for_distillation(feat3d, hidden_states, geo_query_mask, target_n=qs)
+                if tf.shape[0] == sf.shape[0] > 0:
+                    loss = loss + self.calculate_distillation_loss(tf, self.proj_geometry(sf)) \
+                           * getattr(self.config, 'geometry_weight', 1.0)
+            except Exception:
+                pass
+            # Optional: also distill on image tokens (query_image=True)
+            if getattr(self.config, 'query_image', False) and self.proj_3d is not None and feat3d is not None:
+                try:
+                    tf2, sf2 = self.process_feature_for_distillation(feat3d, hidden_states, image_mask)
+                    if tf2.shape[0] == sf2.shape[0] > 0:
+                        loss = loss + self.calculate_distillation_loss(tf2, self.proj_3d(sf2))
+                except Exception:
+                    pass
+
+        # ── Depth query ──────────────────────────────────────────────────────
+        if 'depth' in qt and depth_query_mask is not None:
+            feat_d = video_dict.get('feature_dav2', None)
+            if feat_d is not None:
+                try:
+                    qs = getattr(self.config, 'query_size', 16)
+                    tf, sf = self.process_feature_for_distillation(feat_d, hidden_states, depth_query_mask, target_n=qs)
+                    if tf.shape[0] == sf.shape[0] > 0:
+                        loss = loss + self.calculate_distillation_loss(tf, self.proj_depth(sf)) \
+                               * getattr(self.config, 'depth_weight', 0.5)
+                except Exception:
+                    pass
+
+        return loss
+
+    def _inject_query_tokens(
+        self,
+        inputs_embeds: torch.Tensor,   # (B,T,H)
+        attention_mask: torch.Tensor,  # (B,T)
+        position_ids: torch.Tensor,    # (3,B,T)
+        labels: Optional[torch.Tensor],# (B,T) or None
+        visual_mask: torch.Tensor,     # (B,T) bool
+    ) -> Tuple:
+        """Inject query tokens at visual token boundaries. (3DRS §6.2)
+        Insertion order: [blank_query | image_tokens | geometry_query | depth_query]
+        Also extends labels with IGNORE_INDEX so LM loss shape matches.
+        Returns: inputs_embeds, attention_mask, position_ids, labels, geo_mask, depth_mask
+        """
+        IGNORE_INDEX = -100
+        qt = getattr(self.config, 'query_type', None)
+        dev, dtype = inputs_embeds.device, inputs_embeds.dtype
+        B, T, H = inputs_embeds.shape
+
+        e_out, a_out, p_out, l_out, gm_out, dm_out = [], [], [], [], [], []
+
+        for b in range(B):
+            se = inputs_embeds[b]       # (T,H)
+            sa = attention_mask[b]      # (T,)
+            sp = position_ids[:, b, :]  # (3,T)
+            sl = labels[b] if labels is not None else None
+            sv = visual_mask[b]         # (T,) bool
+
+            # Find contiguous visual token segments
+            segs, in_blk = [], False
+            for t in range(T):
+                if sv[t] and not in_blk:
+                    in_blk, blk_s = True, t
+                elif not sv[t] and in_blk:
+                    in_blk = False; segs.append((blk_s, t))
+            if in_blk:
+                segs.append((blk_s, T))
+
+            if not segs:
+                e_out.append(se); a_out.append(sa); p_out.append(sp)
+                if sl is not None: l_out.append(sl)
+                gm_out.append(torch.zeros(T, dtype=torch.bool, device=dev))
+                dm_out.append(torch.zeros(T, dtype=torch.bool, device=dev))
+                continue
+
+            el, al, ptl, phl, pwl, ll, gml, dml = [], [], [], [], [], [], [], []
+            prev = 0
+
+            for (ss, se_) in segs:
+                # Pre-segment text tokens
+                if prev < ss:
+                    n = ss - prev
+                    el.append(se[prev:ss]); al.append(sa[prev:ss])
+                    ptl.append(sp[0,prev:ss]); phl.append(sp[1,prev:ss]); pwl.append(sp[2,prev:ss])
+                    if sl is not None: ll.append(sl[prev:ss])
+                    gml.append(torch.zeros(n, dtype=torch.bool, device=dev))
+                    dml.append(torch.zeros(n, dtype=torch.bool, device=dev))
+
+                # Anchor position ids from last visual token
+                vt = sp[0,ss:se_].max(); vh = sp[1,ss:se_].max(); vw = sp[2,ss:se_].max()
+                def _pos(n): return (torch.full((n,),vt.item(),device=dev,dtype=sp.dtype),
+                                     torch.full((n,),vh.item(),device=dev,dtype=sp.dtype),
+                                     torch.full((n,),vw.item(),device=dev,dtype=sp.dtype))
+
+                # blank_query: prepend
+                if qt and 'blank' in qt and self.blank_query is not None:
+                    nq = self.blank_query.shape[0]
+                    el.append(self.blank_query.to(dev, dtype)); al.append(torch.ones(nq,device=dev,dtype=sa.dtype))
+                    _t,_h,_w = _pos(nq); ptl.append(_t); phl.append(_h); pwl.append(_w)
+                    if sl is not None: ll.append(torch.full((nq,),IGNORE_INDEX,device=dev,dtype=sl.dtype))
+                    gml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
+                    dml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
+
+                # Visual tokens
+                n = se_ - ss
+                el.append(se[ss:se_]); al.append(sa[ss:se_])
+                ptl.append(sp[0,ss:se_]); phl.append(sp[1,ss:se_]); pwl.append(sp[2,ss:se_])
+                if sl is not None: ll.append(sl[ss:se_])
+                gml.append(torch.zeros(n,dtype=torch.bool,device=dev))
+                dml.append(torch.zeros(n,dtype=torch.bool,device=dev))
+
+                # geometry_query: append after visual
+                if qt and 'geometry' in qt and self.geometry_query is not None:
+                    nq = self.geometry_query.shape[0]
+                    el.append(self.geometry_query.to(dev, dtype)); al.append(torch.ones(nq,device=dev,dtype=sa.dtype))
+                    _t,_h,_w = _pos(nq); ptl.append(_t); phl.append(_h); pwl.append(_w)
+                    if sl is not None: ll.append(torch.full((nq,),IGNORE_INDEX,device=dev,dtype=sl.dtype))
+                    gml.append(torch.ones(nq,dtype=torch.bool,device=dev))
+                    dml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
+
+                # depth_query: append after geometry_query
+                if qt and 'depth' in qt and self.depth_query is not None:
+                    nq = self.depth_query.shape[0]
+                    el.append(self.depth_query.to(dev, dtype)); al.append(torch.ones(nq,device=dev,dtype=sa.dtype))
+                    _t,_h,_w = _pos(nq); ptl.append(_t); phl.append(_h); pwl.append(_w)
+                    if sl is not None: ll.append(torch.full((nq,),IGNORE_INDEX,device=dev,dtype=sl.dtype))
+                    gml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
+                    dml.append(torch.ones(nq,dtype=torch.bool,device=dev))
+
+                prev = se_
+
+            # Remaining text tokens
+            if prev < T:
+                n = T - prev
+                el.append(se[prev:]); al.append(sa[prev:])
+                ptl.append(sp[0,prev:]); phl.append(sp[1,prev:]); pwl.append(sp[2,prev:])
+                if sl is not None: ll.append(sl[prev:])
+                gml.append(torch.zeros(n,dtype=torch.bool,device=dev))
+                dml.append(torch.zeros(n,dtype=torch.bool,device=dev))
+
+            e_out.append(torch.cat(el,0))
+            a_out.append(torch.cat(al,0))
+            p_out.append(torch.stack([torch.cat(ptl), torch.cat(phl), torch.cat(pwl)], 0))  # (3,T_new)
+            if sl is not None: l_out.append(torch.cat(ll,0))
+            gm_out.append(torch.cat(gml,0))
+            dm_out.append(torch.cat(dml,0))
+
+        new_e = torch.stack(e_out, 0)               # (B,T_new,H)
+        new_a = torch.stack(a_out, 0)               # (B,T_new)
+        new_p = torch.stack(p_out, 0).permute(1,0,2)# (3,B,T_new)
+        new_l = torch.stack(l_out, 0) if l_out else None
+        new_gm = torch.stack(gm_out, 0)
+        new_dm = torch.stack(dm_out, 0)
+        return new_e, new_a, new_p, new_l, new_gm, new_dm
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -1882,6 +2157,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         geometry_encoder_inputs: Optional[List[torch.Tensor]] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
+        # ── 3DRS-style distillation: offline npz features from data_3d.py ──────
+        # video_dict keys: 'feature_3d' (VGGT, shape B×S×L×D),
+        #                  'feature_dav2' (DAv2, optional)
+        video_dict: Optional[dict] = None,
         **kwargs,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -2006,6 +2285,27 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        # ── Track visual token mask for distillation ──────────────────────────
+        # Must be computed before query injection (injection shifts sequence positions)
+        if input_ids is not None:
+            _vis_mask_2d = ((input_ids == self.config.image_token_id) |
+                            (input_ids == self.config.video_token_id))  # (B,T) bool
+        else:
+            _vis_mask_2d = None
+
+        # ── Inject query tokens if distillation enabled (3DRS §6.2) ──────────
+        # Extends inputs_embeds, attention_mask, position_ids, and labels
+        # before calling self.model so shapes are consistent.
+        geo_query_mask = depth_query_mask = None
+        if (getattr(self.config, 'use_distillation', False)
+                and getattr(self.config, 'query_type', None) is not None
+                and _vis_mask_2d is not None
+                and attention_mask is not None
+                and position_ids is not None):
+            inputs_embeds, attention_mask, position_ids, labels, geo_query_mask, depth_query_mask = \
+                self._inject_query_tokens(inputs_embeds, attention_mask, position_ids,
+                                         labels, _vis_mask_2d)
+
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
@@ -2035,6 +2335,28 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+
+            # ── 3DRS-style distillation loss (additive to LM loss) ────────────
+            if (getattr(self.config, 'use_distillation', False)
+                    and video_dict is not None
+                    and _vis_mask_2d is not None):
+                # Rebuild image mask in the (possibly extended) hidden_states space.
+                # After injection, image tokens remain at their original positions;
+                # the injected query tokens are tracked by geo/depth query masks.
+                # We pad _vis_mask_2d to match hidden_states seq_len if needed.
+                hs_len = hidden_states.shape[1]
+                img_len = _vis_mask_2d.shape[1]
+                if hs_len > img_len:
+                    pad = torch.zeros((_vis_mask_2d.shape[0], hs_len - img_len),
+                                      dtype=torch.bool, device=hidden_states.device)
+                    _img_mask_extended = torch.cat([_vis_mask_2d, pad], dim=1)
+                else:
+                    _img_mask_extended = _vis_mask_2d[:, :hs_len]
+                distill_loss = self.compute_3d_distillation_loss(
+                    video_dict, hidden_states, _img_mask_extended,
+                    geo_query_mask, depth_query_mask
+                )
+                loss = loss + distill_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]

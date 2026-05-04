@@ -95,6 +95,18 @@ def set_model(model_args, model):
         for n, p in model.geometry_encoder.named_parameters():
             p.requires_grad = False
 
+    if getattr(model_args, 'use_distillation', False):
+        # Query token parameters and projection heads are always trainable
+        for attr in ['geometry_query', 'depth_query', 'blank_query']:
+            param = getattr(model, attr, None)
+            if param is not None:
+                param.requires_grad = True
+        for attr in ['proj_geometry', 'proj_depth', 'proj_3d']:
+            proj = getattr(model, attr, None)
+            if proj is not None:
+                for p in proj.parameters():
+                    p.requires_grad = True
+
 def train(attn_implementation="flash_attention_2"):
     global local_rank
 
@@ -109,7 +121,9 @@ def train(attn_implementation="flash_attention_2"):
     os.makedirs(training_args.output_dir, exist_ok=True)
 
     if "qwen2.5" in model_args.model_name_or_path.lower():
-        if not model_args.use_geometry_encoder:
+        # Use custom class if either Path A (online encoder) or Path B (offline distillation) is needed
+        _need_custom_class = model_args.use_geometry_encoder or getattr(model_args, 'use_distillation', False)
+        if not _need_custom_class:
             from transformers import Qwen2_5_VLForConditionalGeneration
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_args.model_name_or_path,
@@ -127,24 +141,34 @@ def train(attn_implementation="flash_attention_2"):
                 )
 
             for k in [
-                "use_geometry_encoder", 
-                "geometry_encoder_type", 
+                "use_geometry_encoder",
+                "geometry_encoder_type",
                 "reference_frame",
-                "feature_fusion_method", 
+                "feature_fusion_method",
                 "fusion_num_layers",
-                "geometry_merger_type"
+                "geometry_merger_type",
+                # ── 3DRS distillation flags (Phase 1-3) ──────────────────────
+                "use_distillation",
+                "query_type",
+                "query_size",
+                "query_image",
+                "geometry_dim",
+                "depth_dim",
+                "geometry_weight",
+                "depth_weight",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
-            assert model_args.geometry_encoder_path is not None, \
-                "geometry_encoder_path must be set in the config when use_geometry_encoder is True."
+            if model_args.use_geometry_encoder:
+                assert model_args.geometry_encoder_path is not None, \
+                    "geometry_encoder_path must be set when use_geometry_encoder is True."
             model = Qwen2_5_VLForConditionalGenerationWithVGGT.from_pretrained(
                 pretrained_model_name_or_path=model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                geometry_encoder_path=model_args.geometry_encoder_path
+                geometry_encoder_path=model_args.geometry_encoder_path if model_args.use_geometry_encoder else None
             )
 
         data_args.image_processor = AutoProcessor.from_pretrained(
@@ -193,6 +217,10 @@ def train(attn_implementation="flash_attention_2"):
     print(model.config)
     if model_args.use_geometry_encoder:
         setattr(data_args, "use_geometry_encoder", model_args.use_geometry_encoder)
+    # Propagate distillation flags to data_args for feature loading in _get_item
+    if getattr(model_args, 'use_distillation', False):
+        setattr(data_args, 'use_distillation', model_args.use_distillation)
+        setattr(data_args, 'query_type', model_args.query_type)
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module

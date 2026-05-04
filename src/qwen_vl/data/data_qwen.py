@@ -506,6 +506,31 @@ class LazySupervisedDataset(Dataset):
             data_dict["video_grid_thw"] = grid_thw
         
         data_dict["tag"] = self.list_data_dict[i].get("tag", "2d")
+
+        # ── Load offline 3D distillation features (use_distillation=True) ─────
+        # Reads feature_3d.npz and optionally feature_dav2.npz for 3DRS-style
+        # query token distillation. Only active for 3D-tagged data with scene_id.
+        if (getattr(self.data_args, 'use_distillation', False)
+                and data_dict.get('tag') == '3d'
+                and 'scene_id' in self.list_data_dict[i]):
+            scene_id = self.list_data_dict[i]['scene_id']
+            feature_dir = getattr(self.data_args, 'feature_dir', None)
+            if feature_dir is not None:
+                import os, numpy as np
+                video_dict = {}
+                f3d_path = os.path.join(feature_dir, scene_id, 'feature_3d.npz')
+                if os.path.exists(f3d_path):
+                    video_dict['feature_3d'] = torch.from_numpy(
+                        np.load(f3d_path)['feature']).float()
+                query_type = getattr(self.data_args, 'query_type', '') or ''
+                if 'depth' in query_type:
+                    fdav2_path = os.path.join(feature_dir, scene_id, 'feature_dav2.npz')
+                    if os.path.exists(fdav2_path):
+                        video_dict['feature_dav2'] = torch.from_numpy(
+                            np.load(fdav2_path)['feature']).float()
+                if video_dict:
+                    data_dict['video_dict'] = video_dict
+
         return data_dict
 
 
@@ -611,6 +636,24 @@ class DataCollatorForSupervisedDataset(object):
             batch["geometry_encoder_inputs"] = geometry_encoder_inputs
             assert len(set([instance["tag"] for instance in instances])) == 1, "all data in a batch should have the same tag"
             batch["tag"] = instances[0]["tag"]
+
+        # ── Collect video_dict for 3DRS distillation ─────────────────────
+        # Stack feature_3d / feature_dav2 across batch items.
+        # If any item in the batch lacks the key, that key is omitted (graceful degradation).
+        if any('video_dict' in inst for inst in instances):
+            batch_vd: dict = {}
+            for feat_key in ['feature_3d', 'feature_dav2']:
+                feats = [inst['video_dict'][feat_key]
+                         for inst in instances
+                         if 'video_dict' in inst and feat_key in inst['video_dict']]
+                if len(feats) == len(instances):   # all items have this feature
+                    try:
+                        batch_vd[feat_key] = torch.stack(feats, dim=0)
+                    except RuntimeError:
+                        pass  # shape mismatch: skip gracefully
+            if batch_vd:
+                batch['video_dict'] = batch_vd
+
         return batch
 
 
