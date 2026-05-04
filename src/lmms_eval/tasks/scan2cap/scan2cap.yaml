@@ -1,8 +1,9 @@
-dataset_path: data/evaluation/scan2cap
+dataset_path: json
 dataset_kwargs:
-  token: True
+  data_files:
+    validation: data/evaluation/scan2cap/scan2cap_val_32frames.json
 task: "scan2cap"
-test_split: val
+test_split: validation
 output_type: generate_until
 doc_to_visual: !function utils.scan2cap_doc_to_visual
 doc_to_text: !function utils.scan2cap_doc_to_text

@@ -1,8 +1,9 @@
-dataset_path: data/evaluation/scanrefer
+dataset_path: json
 dataset_kwargs:
-  token: True
+  data_files:
+    validation: data/evaluation/scanrefer/scanrefer_val_32frames.json
 task: "scanrefer"
-test_split: val
+test_split: validation
 output_type: generate_until
 doc_to_visual: !function utils.scanrefer_doc_to_visual
 doc_to_text: !function utils.scanrefer_doc_to_text

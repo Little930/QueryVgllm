@@ -102,6 +102,37 @@ class VGLLM(lmms):
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels, padding_side="left")
         self._tokenizer = AutoTokenizer.from_pretrained(pretrained, padding_side="left")
 
+        # Ensure chat_template is available — HF Trainer checkpoints often strip it
+        # from tokenizer_config.json. Fall back to the standard Qwen2.5-VL template.
+        _QWEN25VL_CHAT_TEMPLATE = (
+            "{% set image_count = namespace(value=0) %}"
+            "{% set video_count = namespace(value=0) %}"
+            "{% for message in messages %}"
+            "{% if loop.first and message['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}"
+            "<|im_start|>{{ message['role'] }}\n"
+            "{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n"
+            "{% else %}"
+            "{% for content in message['content'] %}"
+            "{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}"
+            "{% set image_count.value = image_count.value + 1 %}"
+            "<|vision_start|><|image_pad|><|vision_end|>"
+            "{% elif content['type'] == 'video' or 'video' in content %}"
+            "{% set video_count.value = video_count.value + 1 %}"
+            "<|vision_start|><|video_pad|><|vision_end|>"
+            "{% elif 'text' in content %}{{ content['text'] }}{% endif %}"
+            "{% endfor %}<|im_end|>\n{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        )
+        _tok = self.processor.tokenizer
+        if not getattr(_tok, "chat_template", None):
+            eval_logger.warning(
+                "chat_template missing from tokenizer in checkpoint; "
+                "injecting default Qwen2.5-VL template."
+            )
+            _tok.chat_template = _QWEN25VL_CHAT_TEMPLATE
+            self._tokenizer.chat_template = _QWEN25VL_CHAT_TEMPLATE
+
         if max_length is not None:
             eval_logger.warning(f"Setting max_length to {max_length}")
             setattr(self.processor.tokenizer, "model_max_length", max_length)
@@ -272,7 +303,7 @@ class VGLLM(lmms):
 
                 messages.append(message)
 
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            text = self.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             # image_inputs, video_inputs = process_vision_info(messages)
 
             geometry_encoder_inputs = []
