@@ -230,7 +230,7 @@ def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
             lengths=lengths,
             group_by_modality=True,
         )
-    elif self.args.group_by_modality_length_auto:
+    elif getattr(self.args, "group_by_modality_length_auto", False):
         lengths = self.train_dataset.modality_lengths
         return LengthGroupedSampler(
             # self.args.train_batch_size * self.args.gradient_accumulation_steps, # TODO: seems that we should not have gradient_accumulation_steps
@@ -240,7 +240,7 @@ def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
             lengths=lengths,
             group_by_modality_auto=True,
         )
-    elif self.args.group_by_varlen:
+    elif getattr(self.args, "group_by_varlen", False):
         lengths = self.train_dataset.lengths
         return LengthGroupedSampler(
             self.args.train_batch_size * self.args.gradient_accumulation_steps,
