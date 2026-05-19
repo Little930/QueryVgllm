@@ -207,6 +207,8 @@ class LengthGroupedSampler(Sampler):
 
 
 
+original_get_train_sampler = Trainer._get_train_sampler
+
 def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
     if self.train_dataset is None or not has_length(self.train_dataset):
         return None
@@ -251,7 +253,7 @@ def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
             variable_length=True,
         )
     else:
-        return super()._get_train_sampler()
+        return original_get_train_sampler(self)
 
 Trainer._get_train_sampler = _get_train_sampler
 print("Trainer._get_train_sampler replaced with custom implementation.")

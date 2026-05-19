@@ -6,8 +6,8 @@ MASTER_ADDR="127.0.0.1"
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)
 NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 
-MODEL_PATH="/public_datasets/VG-LLM/weights/Qwen2.5-VL-2B-Instruct"
-GEOMETRY_ENCODER_PATH="/public_datasets/VG-LLM/weights/VGGT-1B"
+MODEL_PATH="./Qwen2.5-VL-3B-Instruct"
+GEOMETRY_ENCODER_PATH="./VGGT-1B"
 # Root directory for offline npz files: {FEATURE_DIR}/{scene_id}/feature_3d.npz
 FEATURE_DIR="/public_datasets/VG-LLM/features/scannet"
 DATASETS="scan2cap,scanrefer,scannet_det"

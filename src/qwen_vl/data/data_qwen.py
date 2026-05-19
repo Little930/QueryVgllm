@@ -516,7 +516,6 @@ class LazySupervisedDataset(Dataset):
             scene_id = self.list_data_dict[i]['scene_id']
             feature_dir = getattr(self.data_args, 'feature_dir', None)
             if feature_dir is not None:
-                import os, numpy as np
                 video_dict = {}
                 f3d_path = os.path.join(feature_dir, scene_id, 'feature_3d.npz')
                 if os.path.exists(f3d_path):

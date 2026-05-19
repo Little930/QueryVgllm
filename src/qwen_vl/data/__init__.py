@@ -22,43 +22,43 @@ VIDEOCHATGPT = {
 }
 
 SPAR = {
-    "annotation_path": "/public_datasets/VG-LLM/data/train/spar_7m.jsonl",
+    "annotation_path": "data/train/spar_7m.jsonl",
     "data_path": "data/media",
     "tag": "3d"
 }
 
 SPAR_234K = {
-    "annotation_path": "/public_datasets/VG-LLM/data/train/spar_234k.json",
+    "annotation_path": "data/train/spar_234k.json",
     "data_path": "data/media",
     "tag": "3d"
 }
 
 LLAVA_HOUND = {
-    "annotation_path": "/public_datasets/VG-LLM/data/train/llava_hound_255k.json",
+    "annotation_path": "data/train/llava_hound_255k.json",
     "data_path": "data/media",
     "tag": "2d"
 }
 
 LLAVA_HOUND_64K = {
-    "annotation_path": "/public_datasets/VG-LLM/data/train/llava_hound_64k.json",
+    "annotation_path": "data/train/llava_hound_64k.json",
     "data_path": "data/media",
     "tag": "2d"
 }
 
 SCANNET_DET = {
-    "annotation_path": "/public_datasets/VG-LLM/data/train/scannet_det_train_4frames.json",
+    "annotation_path": "data/train/scannet_det_train_4frames.json",
     "data_path": "data/media",
     "tag": "3d"
 }
 
 SCANREFER = {
-    "annotation_path": "/public_datasets/VG-LLM/data/train/scanrefer_train_32frames.json",
+    "annotation_path": "data/train/scanrefer_train_32frames.json",
     "data_path": "data/media",
     "tag": "3d"
 }
 
 SCAN2CAP = {
-    "annotation_path": "/public_datasets/VG-LLM/data/train/scan2cap_train_32frames.json",
+    "annotation_path": "data/train/scan2cap_train_32frames.json",
     "data_path": "data/media",
     "tag": "3d"
 }
