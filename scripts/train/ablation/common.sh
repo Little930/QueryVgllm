@@ -4,7 +4,7 @@
 
 MASTER_ADDR="127.0.0.1"
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)
-NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
+NPROC_PER_NODE=4
 
 MODEL_PATH="./Qwen2.5-VL-3B-Instruct"
 GEOMETRY_ENCODER_PATH="./VGGT-1B"

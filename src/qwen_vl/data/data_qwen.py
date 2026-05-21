@@ -509,26 +509,39 @@ class LazySupervisedDataset(Dataset):
 
         # ── Load offline 3D distillation features (use_distillation=True) ─────
         # Reads feature_3d.npz and optionally feature_dav2.npz for 3DRS-style
-        # query token distillation. Only active for 3D-tagged data with scene_id.
+        # query token distillation. Only active for 3D-tagged data.
         if (getattr(self.data_args, 'use_distillation', False)
-                and data_dict.get('tag') == '3d'
-                and 'scene_id' in self.list_data_dict[i]):
-            scene_id = self.list_data_dict[i]['scene_id']
-            feature_dir = getattr(self.data_args, 'feature_dir', None)
-            if feature_dir is not None:
-                video_dict = {}
-                f3d_path = os.path.join(feature_dir, scene_id, 'feature_3d.npz')
-                if os.path.exists(f3d_path):
-                    video_dict['feature_3d'] = torch.from_numpy(
-                        np.load(f3d_path)['feature']).float()
-                query_type = getattr(self.data_args, 'query_type', '') or ''
-                if 'depth' in query_type:
-                    fdav2_path = os.path.join(feature_dir, scene_id, 'feature_dav2.npz')
-                    if os.path.exists(fdav2_path):
-                        video_dict['feature_dav2'] = torch.from_numpy(
-                            np.load(fdav2_path)['feature']).float()
-                if video_dict:
-                    data_dict['video_dict'] = video_dict
+                and data_dict.get('tag') == '3d'):
+            # Extract scene_id: prefer explicit field, fallback to parsing image paths
+            # e.g. "scannet/posed_images/scene0000_00/01140.jpg" → "scene0000_00"
+            raw_data = self.list_data_dict[i]
+            scene_id = raw_data.get('scene_id', None)
+            if scene_id is None:
+                img_list = raw_data.get('image', raw_data.get('images', []))
+                if isinstance(img_list, list) and len(img_list) > 0:
+                    img_path = img_list[0] if isinstance(img_list[0], str) else ''
+                    parts = img_path.split('/')
+                    # Look for part matching 'scene*' pattern
+                    for part in parts:
+                        if part.startswith('scene'):
+                            scene_id = part
+                            break
+            if scene_id is not None:
+                feature_dir = getattr(self.data_args, 'feature_dir', None)
+                if feature_dir is not None:
+                    video_dict = {}
+                    f3d_path = os.path.join(feature_dir, scene_id, 'feature_3d.npz')
+                    if os.path.exists(f3d_path):
+                        video_dict['feature_3d'] = torch.from_numpy(
+                            np.load(f3d_path)['feature']).float()
+                    query_type = getattr(self.data_args, 'query_type', '') or ''
+                    if 'depth' in query_type:
+                        fdav2_path = os.path.join(feature_dir, scene_id, 'feature_dav2.npz')
+                        if os.path.exists(fdav2_path):
+                            video_dict['feature_dav2'] = torch.from_numpy(
+                                np.load(fdav2_path)['feature']).float()
+                    if video_dict:
+                        data_dict['video_dict'] = video_dict
 
         return data_dict
 

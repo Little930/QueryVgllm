@@ -271,12 +271,20 @@ class GeometryFeatureMerger(nn.Module):
                 nn.GELU(),
                 nn.Linear(self.hidden_dim, self.output_dim),
             )
+            # Zero-init output layer so merger starts as identity (outputs zeros).
+            # This prevents random noise from corrupting pretrained visual
+            # embeddings when fused via 'add'.
+            nn.init.zeros_(self.mlp[2].weight)
+            nn.init.zeros_(self.mlp[2].bias)
         elif merger_type == "avg":
             self.mlp = nn.Sequential(
                 nn.Linear(context_dim, self.hidden_dim),
                 nn.GELU(),
                 nn.Linear(self.hidden_dim, self.output_dim),
             )
+            # Zero-init output layer (same reason as above)
+            nn.init.zeros_(self.mlp[2].weight)
+            nn.init.zeros_(self.mlp[2].bias)
         elif merger_type == "attention":
             # Add attention-based merger for future extensibility
             raise NotImplementedError("Attention merger not implemented yet")

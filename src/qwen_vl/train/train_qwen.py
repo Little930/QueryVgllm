@@ -84,16 +84,25 @@ def set_model(model_args, model):
     if model_args.tune_mm_llm:
         for n, p in model.model.named_parameters():
             p.requires_grad = True
-        model.lm_head.requires_grad = True
+        for p in model.lm_head.parameters():
+            p.requires_grad = True
     else:
         for n, p in model.model.named_parameters():
             p.requires_grad = False
-        model.lm_head.requires_grad = False
+        for p in model.lm_head.parameters():
+            p.requires_grad = False
 
     if model_args.use_geometry_encoder:
-        # vggt is frozen
+        # vggt backbone is frozen
         for n, p in model.geometry_encoder.named_parameters():
             p.requires_grad = False
+        # geometry_merger and feature_fusion are trainable
+        if hasattr(model, 'geometry_merger'):
+            for p in model.geometry_merger.parameters():
+                p.requires_grad = True
+        if hasattr(model, 'feature_fusion'):
+            for p in model.feature_fusion.parameters():
+                p.requires_grad = True
 
     if getattr(model_args, 'use_distillation', False):
         # Query token parameters and projection heads are always trainable
