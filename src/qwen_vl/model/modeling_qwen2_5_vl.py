@@ -1598,6 +1598,13 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Re-apply zero-init AFTER post_init(), because _init_weights()
+        # reinitializes all nn.Linear with random normal, overwriting our zeros.
+        if hasattr(self, 'geometry_merger') and hasattr(self.geometry_merger, 'mlp'):
+            last_linear = self.geometry_merger.mlp[2]  # output layer
+            nn.init.zeros_(last_linear.weight)
+            nn.init.zeros_(last_linear.bias)
     
     def _init_geometry_encoder(self, config):
         """Initialize geometry encoder and related modules."""
