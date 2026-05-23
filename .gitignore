@@ -7,4 +7,6 @@ checkpoints/
 
 3DRS/
 *.whl
+node_modules/
+outputs/
 

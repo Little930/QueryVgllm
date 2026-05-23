@@ -508,8 +508,8 @@ class LazySupervisedDataset(Dataset):
         data_dict["tag"] = self.list_data_dict[i].get("tag", "2d")
 
         # ── Load offline 3D distillation features (use_distillation=True) ─────
-        # Reads feature_3d.npz and optionally feature_dav2.npz for 3DRS-style
-        # query token distillation. Only active for 3D-tagged data.
+        # Reads vggt.npz (with ps_idx for patch slicing) and optionally depth.npz
+        # for 3DRS-style query token distillation. Only active for 3D-tagged data.
         if (getattr(self.data_args, 'use_distillation', False)
                 and data_dict.get('tag') == '3d'):
             # Extract scene_id: prefer explicit field, fallback to parsing image paths
@@ -530,13 +530,18 @@ class LazySupervisedDataset(Dataset):
                 feature_dir = getattr(self.data_args, 'feature_dir', None)
                 if feature_dir is not None:
                     video_dict = {}
-                    f3d_path = os.path.join(feature_dir, scene_id, 'feature_3d.npz')
+                    # VGGT features: vggt.npz with 'feature' and 'ps_idx' keys
+                    # Format from 3DRS official extract_vggt_feature.py
+                    f3d_path = os.path.join(feature_dir, scene_id, 'vggt.npz')
                     if os.path.exists(f3d_path):
-                        video_dict['feature_3d'] = torch.from_numpy(
-                            np.load(f3d_path)['feature']).float()
+                        data = np.load(f3d_path)
+                        ps_idx = int(data['ps_idx'])
+                        # Slice out patch tokens only (discard camera/global tokens)
+                        feature = data['feature'][:, :, ps_idx:, :]
+                        video_dict['feature_3d'] = torch.from_numpy(feature).float()
                     query_type = getattr(self.data_args, 'query_type', '') or ''
                     if 'depth' in query_type:
-                        fdav2_path = os.path.join(feature_dir, scene_id, 'feature_dav2.npz')
+                        fdav2_path = os.path.join(feature_dir, scene_id, 'depth.npz')
                         if os.path.exists(fdav2_path):
                             video_dict['feature_dav2'] = torch.from_numpy(
                                 np.load(fdav2_path)['feature']).float()

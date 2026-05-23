@@ -55,9 +55,9 @@ class DataArguments:
     max_samples: int = field(default=-1)
     shuffle: bool = field(default=True)
     # ── 3DRS distillation data args ────────────────────────────────────────────
-    # feature_dir: root dir containing {scene_id}/feature_3d.npz (and feature_dav2.npz)
-    # These are set dynamically from model_args in train_qwen.py
-    feature_dir: Optional[str] = field(default=None, metadata={"help": "Root dir for offline 3D feature npz files ({feature_dir}/{scene_id}/feature_3d.npz)"})
+    # feature_dir: root dir containing {scene_id}/vggt.npz (and depth.npz)
+    # Loaded by data_3d.py: get_3d_features() reads {feature_3d_path}/{scene_id}/vggt.npz
+    feature_dir: Optional[str] = field(default=None, metadata={"help": "Root dir for offline 3D feature npz files ({feature_dir}/{scene_id}/vggt.npz)"})
     use_distillation: bool = field(default=False)
     query_type: Optional[str] = field(default=None)
 
