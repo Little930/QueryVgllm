@@ -21,6 +21,6 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
     --query_size 16 \
     --geometry_dim 2048 \
     --geometry_weight 1.0 \
-    --model_max_length 8192 \
-    --max_pixels $((384*28*28)) \
+    --model_max_length 12800 \
+    --max_pixels $((256*28*28)) \
     > ${OUTPUT_DIR}/train.log 2>&1
