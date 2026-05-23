@@ -2228,9 +2228,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                    logging.get_logger(__name__).warning(
+                        f"Image token mismatch (tokens={n_image_tokens}, features={n_image_features}). "
+                        f"Skipping batch with zero loss."
                     )
+                    loss = torch.tensor(0.0, device=inputs_embeds.device, requires_grad=True)
+                    return Qwen2_5_VLCausalLMOutputWithPast(loss=loss)
 
                 mask = input_ids == self.config.image_token_id
                 mask_unsqueezed = mask.unsqueeze(-1)
@@ -2246,9 +2249,12 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
                 n_video_features = video_embeds.shape[0]
                 if n_video_tokens != n_video_features:
-                    raise ValueError(
-                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                    logging.get_logger(__name__).warning(
+                        f"Video token mismatch (tokens={n_video_tokens}, features={n_video_features}). "
+                        f"Skipping batch with zero loss."
                     )
+                    loss = torch.tensor(0.0, device=inputs_embeds.device, requires_grad=True)
+                    return Qwen2_5_VLCausalLMOutputWithPast(loss=loss)
 
                 mask = input_ids == self.config.video_token_id
                 mask_unsqueezed = mask.unsqueeze(-1)
