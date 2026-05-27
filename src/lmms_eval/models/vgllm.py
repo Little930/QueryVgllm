@@ -80,7 +80,7 @@ class VGLLM(lmms):
 
         config = AutoConfig.from_pretrained(pretrained)
 
-        if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False):
+        if getattr(config, "use_geometry_encoder", False) or getattr(config, "use_vggt_feature", False) or getattr(config, "use_distillation", False):
             load_class = Qwen2_5_VLForConditionalGenerationWithVGGT
             eval_logger.info("Using Qwen2_5_VLForConditionalGenerationWithVGGT")
         else:
