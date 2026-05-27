@@ -2304,6 +2304,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         # Extends inputs_embeds, attention_mask, position_ids, and labels
         # before calling self.model so shapes are consistent.
         geo_query_mask = depth_query_mask = None
+        _pre_inject_len = inputs_embeds.shape[1]
         if (getattr(self.config, 'use_distillation', False)
                 and getattr(self.config, 'query_type', None) is not None
                 and _vis_mask_2d is not None
@@ -2312,6 +2313,34 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             inputs_embeds, attention_mask, position_ids, labels, geo_query_mask, depth_query_mask = \
                 self._inject_query_tokens(inputs_embeds, attention_mask, position_ids,
                                          labels, _vis_mask_2d)
+
+        # ── Fix cache_position / rope_deltas after query injection ────────────
+        # _inject_query_tokens extends the sequence from T to T+Nq, but HF
+        # generate tracks cache_position based on the original input_ids length.
+        # We must keep them in sync so causal mask, KV cache indexing, and
+        # positional embeddings in subsequent decode steps are correct.
+        _nq_injected = inputs_embeds.shape[1] - _pre_inject_len
+        # Always reset offset at the start of each generate() prefill to avoid
+        # stale values from a previous sample leaking into the next one.
+        if cache_position is not None and cache_position[0] == 0:
+            self._distill_query_offset = 0
+        if _nq_injected > 0:
+            # Store offset so prepare_inputs_for_generation can fix decode steps
+            self._distill_query_offset = _nq_injected
+            # Extend cache_position to cover the injected tokens (prefill)
+            if cache_position is not None and cache_position.shape[0] == _pre_inject_len:
+                start = cache_position[0].item()
+                cache_position = torch.arange(
+                    start, start + inputs_embeds.shape[1],
+                    device=cache_position.device, dtype=cache_position.dtype,
+                )
+            # Adjust rope_deltas: query tokens share visual positions and do
+            # not advance the temporal position counter, but they DO occupy
+            # extra KV cache slots.  rope_deltas = max_pos + 1 - T, and after
+            # injection the cache length is T+Nq, so we subtract Nq to keep
+            # decode-step position_ids = cache_pos + rope_deltas correct.
+            if hasattr(self, 'rope_deltas') and self.rope_deltas is not None:
+                self.rope_deltas = self.rope_deltas - _nq_injected
 
         outputs = self.model(
             input_ids=None,
@@ -2395,6 +2424,23 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
+
+        # ── Fix cache_position & attention_mask for distillation decode steps ──
+        # During prefill, _inject_query_tokens inserted Nq extra tokens into the
+        # sequence.  HF generate doesn't know about them, so its cache_position
+        # and attention_mask are off by Nq in every subsequent decode step.
+        _offset = getattr(self, '_distill_query_offset', 0)
+        if _offset > 0 and cache_position is not None and cache_position[0] != 0:
+            cache_position = cache_position + _offset
+            # Pad attention_mask so its length covers the full KV cache
+            if attention_mask is not None:
+                needed = cache_position[-1].item() + 1
+                cur = attention_mask.shape[-1]
+                if cur < needed:
+                    attention_mask = torch.cat([
+                        attention_mask,
+                        attention_mask.new_ones((attention_mask.shape[0], needed - cur)),
+                    ], dim=-1)
 
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
