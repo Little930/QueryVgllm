@@ -538,13 +538,18 @@ class LazySupervisedDataset(Dataset):
                         ps_idx = int(data['ps_idx'])
                         # Slice out patch tokens only (discard camera/global tokens)
                         feature = data['feature'][:, :, ps_idx:, :]
+                        # VGGT extraction saves with batch dim: (1, S, L, D) → squeeze to (S, L, D)
+                        if feature.ndim == 4 and feature.shape[0] == 1:
+                            feature = feature.squeeze(0)
                         video_dict['feature_3d'] = torch.from_numpy(feature).float()
                     query_type = getattr(self.data_args, 'query_type', '') or ''
                     if 'depth' in query_type:
                         fdav2_path = os.path.join(feature_dir, scene_id, 'depth.npz')
                         if os.path.exists(fdav2_path):
-                            video_dict['feature_dav2'] = torch.from_numpy(
-                                np.load(fdav2_path)['feature']).float()
+                            feat_d = np.load(fdav2_path)['feature']
+                            if feat_d.ndim == 4 and feat_d.shape[0] == 1:
+                                feat_d = feat_d.squeeze(0)
+                            video_dict['feature_dav2'] = torch.from_numpy(feat_d).float()
                     if video_dict:
                         data_dict['video_dict'] = video_dict
 

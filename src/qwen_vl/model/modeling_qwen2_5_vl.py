@@ -1716,11 +1716,23 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         B, S, L, D = teacher_feat.shape
         teacher_feat = teacher_feat.to(device=device, dtype=dtype)
 
+        # ── Auto-align teacher frame count to student image count ─────────
+        # VGGT features may have been extracted with 32 frames, but training
+        # may use fewer images (e.g., scannet_det uses 4).  Uniformly
+        # subsample teacher frames so shapes match.
+        n_student = token_mask.sum().item()
+        if target_n is not None and target_n > 0 and n_student > 0:
+            n_student_images = n_student // target_n
+            if n_student_images > 0 and S != n_student_images:
+                indices = torch.linspace(0, S - 1, n_student_images).long()
+                teacher_feat = teacher_feat[:, indices]
+                S = n_student_images
+
         # Determine spatial layout from L (3DRS §3.2 resolution dispatch)
         _layouts = {4096: (64,64), 1036: (28,37), 768: (24,32), 256: (16,16), 196: (14,14)}
         h, w = _layouts.get(L, (int(L**0.5), int(L**0.5)))
 
-        feat = teacher_feat.view(B*S, D, h, w)
+        feat = teacher_feat.reshape(B*S, L, D).permute(0, 2, 1).reshape(B*S, D, h, w)
         if target_n is not None:
             side = max(1, int(target_n**0.5))
             feat = F.adaptive_avg_pool2d(feat, (side, side))
@@ -1774,8 +1786,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 tf, sf = self.process_feature_for_distillation(feat3d, hidden_states, image_mask)
                 if tf.shape[0] == sf.shape[0] > 0:
                     loss = self.calculate_distillation_loss(tf, self.proj_3d(sf))
-            except Exception:
-                pass
+            except Exception as e:
+                import logging; logging.warning(f"[DISTILL] degenerate loss FAILED: {type(e).__name__}: {e}")
             return loss
 
         # ── Geometry query ───────────────────────────────────────────────────
@@ -1786,16 +1798,16 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 if tf.shape[0] == sf.shape[0] > 0:
                     loss = loss + self.calculate_distillation_loss(tf, self.proj_geometry(sf)) \
                            * getattr(self.config, 'geometry_weight', 1.0)
-            except Exception:
-                pass
+            except Exception as e:
+                import logging; logging.warning(f"[DISTILL] geometry query loss FAILED: {type(e).__name__}: {e}")
             # Optional: also distill on image tokens (query_image=True)
             if getattr(self.config, 'query_image', False) and self.proj_3d is not None and feat3d is not None:
                 try:
                     tf2, sf2 = self.process_feature_for_distillation(feat3d, hidden_states, image_mask)
                     if tf2.shape[0] == sf2.shape[0] > 0:
                         loss = loss + self.calculate_distillation_loss(tf2, self.proj_3d(sf2))
-                except Exception:
-                    pass
+                except Exception as e:
+                    import logging; logging.warning(f"[DISTILL] image token loss FAILED: {type(e).__name__}: {e}")
 
         # ── Depth query ──────────────────────────────────────────────────────
         if 'depth' in qt and depth_query_mask is not None:
@@ -1807,8 +1819,8 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     if tf.shape[0] == sf.shape[0] > 0:
                         loss = loss + self.calculate_distillation_loss(tf, self.proj_depth(sf)) \
                                * getattr(self.config, 'depth_weight', 0.5)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import logging; logging.warning(f"[DISTILL] depth query loss FAILED: {type(e).__name__}: {e}")
 
         return loss
 
