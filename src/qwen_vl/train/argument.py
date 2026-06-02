@@ -39,6 +39,8 @@ class ModelArguments:
     depth_dim: int = field(default=1024, metadata={"help": "Projection output dim for DAv2 depth features"})
     geometry_weight: float = field(default=1.0, metadata={"help": "Loss weight for geometry distillation"})
     depth_weight: float = field(default=0.5, metadata={"help": "Loss weight for depth distillation (3DRS default=0.5)"})
+    distill_warmup_steps: int = field(default=0, metadata={"help": "Linear warmup (in training micro-batches) for the distillation loss weight; 0 disables. Protects the LM early."})
+    distill_max_frames: int = field(default=32, metadata={"help": "Logic B (query injection): query param rows = distill_max_frames * query_size (faithful to 3DRS fork 32*query_size). Must be >= max frames per sample."})
     ground_loss_weight: Optional[float] = field(default=None, metadata={"help": "Loss weight for grounding loss"})
     use_object_proposals: bool = field(default=False, metadata={"help": "Enable grounding using object proposals"})
 @dataclass

@@ -268,6 +268,12 @@ class Qwen2_5_VLConfig(PretrainedConfig):
         # 各路蒸馏损失权重
         self.geometry_weight = kwargs.pop("geometry_weight", 1.0)
         self.depth_weight = kwargs.pop("depth_weight", 0.5)   # 3DRS 硬编码为 0.5
+        # 蒸馏损失权重的线性 warmup（按训练 micro-batch 计），0=关闭。
+        # 让 3D 辅助损失前期慢慢加入，避免早期破坏 LLM 的语言能力。
+        self.distill_warmup_steps = kwargs.pop("distill_warmup_steps", 0)
+        # Logic B(query 注入)用：query 参数行数 = distill_max_frames * query_size。
+        # 对齐 3DRS fork 的 32*query_size；需 ≥ 数据里单样本最大帧数。
+        self.distill_max_frames = kwargs.pop("distill_max_frames", 32)
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.

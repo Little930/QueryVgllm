@@ -25,6 +25,7 @@
 # limitations under the License.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 from typing_extensions import override
@@ -1670,11 +1671,23 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
     # ─────────────────────────────────────────────────────────────────────────
 
     def _init_distillation_modules(self, config):
-        """Init query token params and projection heads. (3DRS §2.2)
-        Key diff vs 3DRS: query_size=total tokens per image (not 32*qs per video).
+        """Init query token params and projection heads.
+
+        Two selectable distillation logics (chosen by config.query_type):
+          • query_type=None       → Logic A = OFFICIAL 3DRS: image-token
+            distillation, NO query injection (proj_3d on image-token hidden).
+          • query_type=geometry/depth/blank → Logic B = 3DRS FORK: ONE
+            consolidated query block of (max_frames*query_size) appended after
+            ALL image content (faithful to llava_qwen.py: 32*query_size).
+
+        Faithful to the fork, query params are DISTINCT per (frame, slot):
+        shape = (distill_max_frames * query_size, H), sliced to n_frames*qs at
+        injection time.
         """
         qt = getattr(config, 'query_type', None)
         qs = getattr(config, 'query_size', 16)
+        mf = getattr(config, 'distill_max_frames', 32)   # fork hardcodes 32
+        nq = mf * qs                                       # total query rows
         H = config.hidden_size
         self.geometry_query = None
         self.depth_query = None
@@ -1690,16 +1703,16 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
 
         if qt and 'blank' in qt:
             # Control group: adds capacity without distillation signal
-            self.blank_query = nn.Parameter(torch.zeros(qs, H))
+            self.blank_query = nn.Parameter(torch.zeros(nq, H))
 
         if qt and 'geometry' in qt:
             self.proj_geometry = _proj(getattr(config, 'geometry_dim', 2048))
-            self.geometry_query = nn.Parameter(torch.zeros(qs, H))
+            self.geometry_query = nn.Parameter(torch.zeros(nq, H))
             nn.init.normal_(self.geometry_query, mean=0.0, std=0.02)
 
         if qt and 'depth' in qt:
             self.proj_depth = _proj(getattr(config, 'depth_dim', 1024))
-            self.depth_query = nn.Parameter(torch.zeros(qs, H))
+            self.depth_query = nn.Parameter(torch.zeros(nq, H))
             nn.init.normal_(self.depth_query, mean=0.0, std=0.02)
 
     def process_feature_for_distillation(
@@ -1727,6 +1740,17 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 indices = torch.linspace(0, S - 1, n_student_images).long()
                 teacher_feat = teacher_feat[:, indices]
                 S = n_student_images
+        # Image-token path (target_n=None): align teacher FRAME count so that
+        # S*L == n_student (total image tokens).  VGGT may have been extracted
+        # with a different frame count than the student actually sees; uniformly
+        # subsample teacher frames.  Assumes student frames are a uniform subset
+        # of the teacher's frames (holds for force_sample uniform sampling).
+        elif target_n is None and n_student > 0 and L > 0 and (n_student % L) == 0:
+            n_student_frames = n_student // L
+            if n_student_frames > 0 and S != n_student_frames:
+                indices = torch.linspace(0, S - 1, n_student_frames).long()
+                teacher_feat = teacher_feat[:, indices]
+                S = n_student_frames
 
         # Determine spatial layout from L (3DRS §3.2 resolution dispatch)
         _layouts = {4096: (64,64), 1036: (28,37), 768: (24,32), 256: (16,16), 196: (14,14)}
@@ -1785,9 +1809,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             try:
                 tf, sf = self.process_feature_for_distillation(feat3d, hidden_states, image_mask)
                 if tf.shape[0] == sf.shape[0] > 0:
-                    loss = self.calculate_distillation_loss(tf, self.proj_3d(sf))
+                    # Output-side image-token distillation (3DRS-faithful, no
+                    # input tokens injected). Weighted by geometry_weight.
+                    loss = self.calculate_distillation_loss(tf, self.proj_3d(sf)) \
+                           * getattr(self.config, 'geometry_weight', 0.5)
+                else:
+                    # Loud warning: if shapes don't match the loss silently
+                    # becomes 0 and training degenerates to plain vanilla.
+                    import logging; logging.warning(
+                        f"[DISTILL] image-token SHAPE MISMATCH: teacher={tf.shape[0]} "
+                        f"student={sf.shape[0]} -> distill SKIPPED (== vanilla!). "
+                        f"Check VGGT feature (S,L) vs image-token grid per frame.")
             except Exception as e:
-                import logging; logging.warning(f"[DISTILL] degenerate loss FAILED: {type(e).__name__}: {e}")
+                import logging; logging.warning(f"[DISTILL] image-token loss FAILED: {type(e).__name__}: {e}")
             return loss
 
         # ── Geometry query ───────────────────────────────────────────────────
@@ -1832,8 +1866,15 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         labels: Optional[torch.Tensor],# (B,T) or None
         visual_mask: torch.Tensor,     # (B,T) bool
     ) -> Tuple:
-        """Inject query tokens at visual token boundaries. (3DRS §6.2)
-        Insertion order: [blank_query | image_tokens | geometry_query | depth_query]
+        """Logic B (3DRS-FORK): inject ONE consolidated query block after ALL
+        image content (faithful to llava_qwen.py / llava_arch.py, where the
+        query is a single 32*query_size block appended once — NOT per-frame).
+
+        Final layout per sample:
+            [pre-text] [blank?] [ALL image tokens] [geometry?] [depth?] [post-text]
+        where each query block has n_frames*query_size rows (frame-major),
+        sliced from the (max_frames*query_size, H) parameter.
+
         Also extends labels with IGNORE_INDEX so LM loss shape matches.
         Returns: inputs_embeds, attention_mask, position_ids, labels, geo_mask, depth_mask
         """
@@ -1868,70 +1909,56 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 dm_out.append(torch.zeros(T, dtype=torch.bool, device=dev))
                 continue
 
+            qs = getattr(self.config, 'query_size', 16)
             el, al, ptl, phl, pwl, ll, gml, dml = [], [], [], [], [], [], [], []
-            prev = 0
+            n_frames = len(segs)
+            first_start = segs[0][0]
+            last_end = segs[-1][1]
+            n_req = n_frames * qs          # query rows requested (frame-major)
 
-            for (ss, se_) in segs:
-                # Pre-segment text tokens
-                if prev < ss:
-                    n = ss - prev
-                    el.append(se[prev:ss]); al.append(sa[prev:ss])
-                    ptl.append(sp[0,prev:ss]); phl.append(sp[1,prev:ss]); pwl.append(sp[2,prev:ss])
-                    if sl is not None: ll.append(sl[prev:ss])
-                    gml.append(torch.zeros(n, dtype=torch.bool, device=dev))
-                    dml.append(torch.zeros(n, dtype=torch.bool, device=dev))
+            # ── Helpers ─────────────────────────────────────────────────────────
+            def _emit_raw(a, c):
+                """Copy original tokens [a:c] verbatim (no query, positions kept)."""
+                if c <= a:
+                    return
+                n = c - a
+                el.append(se[a:c]); al.append(sa[a:c])
+                ptl.append(sp[0, a:c]); phl.append(sp[1, a:c]); pwl.append(sp[2, a:c])
+                if sl is not None: ll.append(sl[a:c])
+                gml.append(torch.zeros(n, dtype=torch.bool, device=dev))
+                dml.append(torch.zeros(n, dtype=torch.bool, device=dev))
 
-                # Anchor position ids from last visual token
-                vt = sp[0,ss:se_].max(); vh = sp[1,ss:se_].max(); vw = sp[2,ss:se_].max()
-                def _pos(n): return (torch.full((n,),vt.item(),device=dev,dtype=sp.dtype),
-                                     torch.full((n,),vh.item(),device=dev,dtype=sp.dtype),
-                                     torch.full((n,),vw.item(),device=dev,dtype=sp.dtype))
+            def _emit_query(param, pt, ph, pw, is_geo, is_depth):
+                """Emit ONE consolidated query block (first n_req rows of param)."""
+                block = param[:n_req].to(dev, dtype)
+                n = block.shape[0]
+                el.append(block); al.append(torch.ones(n, device=dev, dtype=sa.dtype))
+                ptl.append(torch.full((n,), pt, device=dev, dtype=sp.dtype))
+                phl.append(torch.full((n,), ph, device=dev, dtype=sp.dtype))
+                pwl.append(torch.full((n,), pw, device=dev, dtype=sp.dtype))
+                if sl is not None: ll.append(torch.full((n,), IGNORE_INDEX, device=dev, dtype=sl.dtype))
+                gml.append(torch.full((n,), is_geo, dtype=torch.bool, device=dev))
+                dml.append(torch.full((n,), is_depth, dtype=torch.bool, device=dev))
 
-                # blank_query: prepend
-                if qt and 'blank' in qt and self.blank_query is not None:
-                    nq = self.blank_query.shape[0]
-                    el.append(self.blank_query.to(dev, dtype)); al.append(torch.ones(nq,device=dev,dtype=sa.dtype))
-                    _t,_h,_w = _pos(nq); ptl.append(_t); phl.append(_h); pwl.append(_w)
-                    if sl is not None: ll.append(torch.full((nq,),IGNORE_INDEX,device=dev,dtype=sl.dtype))
-                    gml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
-                    dml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
+            # Position anchor for query blocks = the LAST visual token (corner).
+            # Query blocks share this position, so the sequence's max position is
+            # unchanged after injection → the existing KV-cache / rope_deltas
+            # handling (offset = Nq) stays valid.
+            vt = sp[0, last_end - 1].item(); vh = sp[1, last_end - 1].item(); vw = sp[2, last_end - 1].item()
 
-                # Visual tokens
-                n = se_ - ss
-                el.append(se[ss:se_]); al.append(sa[ss:se_])
-                ptl.append(sp[0,ss:se_]); phl.append(sp[1,ss:se_]); pwl.append(sp[2,ss:se_])
-                if sl is not None: ll.append(sl[ss:se_])
-                gml.append(torch.zeros(n,dtype=torch.bool,device=dev))
-                dml.append(torch.zeros(n,dtype=torch.bool,device=dev))
-
-                # geometry_query: append after visual
-                if qt and 'geometry' in qt and self.geometry_query is not None:
-                    nq = self.geometry_query.shape[0]
-                    el.append(self.geometry_query.to(dev, dtype)); al.append(torch.ones(nq,device=dev,dtype=sa.dtype))
-                    _t,_h,_w = _pos(nq); ptl.append(_t); phl.append(_h); pwl.append(_w)
-                    if sl is not None: ll.append(torch.full((nq,),IGNORE_INDEX,device=dev,dtype=sl.dtype))
-                    gml.append(torch.ones(nq,dtype=torch.bool,device=dev))
-                    dml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
-
-                # depth_query: append after geometry_query
-                if qt and 'depth' in qt and self.depth_query is not None:
-                    nq = self.depth_query.shape[0]
-                    el.append(self.depth_query.to(dev, dtype)); al.append(torch.ones(nq,device=dev,dtype=sa.dtype))
-                    _t,_h,_w = _pos(nq); ptl.append(_t); phl.append(_h); pwl.append(_w)
-                    if sl is not None: ll.append(torch.full((nq,),IGNORE_INDEX,device=dev,dtype=sl.dtype))
-                    gml.append(torch.zeros(nq,dtype=torch.bool,device=dev))
-                    dml.append(torch.ones(nq,dtype=torch.bool,device=dev))
-
-                prev = se_
-
-            # Remaining text tokens
-            if prev < T:
-                n = T - prev
-                el.append(se[prev:]); al.append(sa[prev:])
-                ptl.append(sp[0,prev:]); phl.append(sp[1,prev:]); pwl.append(sp[2,prev:])
-                if sl is not None: ll.append(sl[prev:])
-                gml.append(torch.zeros(n,dtype=torch.bool,device=dev))
-                dml.append(torch.zeros(n,dtype=torch.bool,device=dev))
+            # ── Faithful 3DRS-fork layout: ONE consolidated block per type ──────
+            #   [pre-text] [blank] [ALL image content] [geometry] [depth] [post-text]
+            # (vs the old per-frame scatter; matches llava_qwen.py 32*query_size.)
+            _emit_raw(0, first_start)                                       # pre-image text
+            if qt and 'blank' in qt and self.blank_query is not None:      # blank prepended
+                bt = sp[0, first_start].item(); bh = sp[1, first_start].item(); bw = sp[2, first_start].item()
+                _emit_query(self.blank_query, bt, bh, bw, False, False)
+            _emit_raw(first_start, last_end)                               # all image content
+            if qt and 'geometry' in qt and self.geometry_query is not None:
+                _emit_query(self.geometry_query, vt, vh, vw, True, False)
+            if qt and 'depth' in qt and self.depth_query is not None:
+                _emit_query(self.depth_query, vt, vh, vw, False, True)
+            _emit_raw(last_end, T)                                          # post-image text
 
             e_out.append(torch.cat(el,0))
             a_out.append(torch.cat(al,0))
@@ -2317,11 +2344,13 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
         # before calling self.model so shapes are consistent.
         geo_query_mask = depth_query_mask = None
         _pre_inject_len = inputs_embeds.shape[1]
+        _disable_inject = os.environ.get('DISABLE_QUERY_INJECT', '0') == '1'
         if (getattr(self.config, 'use_distillation', False)
                 and getattr(self.config, 'query_type', None) is not None
                 and _vis_mask_2d is not None
                 and attention_mask is not None
-                and position_ids is not None):
+                and position_ids is not None
+                and not _disable_inject):
             inputs_embeds, attention_mask, position_ids, labels, geo_query_mask, depth_query_mask = \
                 self._inject_query_tokens(inputs_embeds, attention_mask, position_ids,
                                          labels, _vis_mask_2d)
@@ -2404,7 +2433,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                     video_dict, hidden_states, _img_mask_extended,
                     geo_query_mask, depth_query_mask
                 )
-                loss = loss + distill_loss
+                # Linear warmup on the distillation weight: the auxiliary 3D
+                # loss ramps in gradually so it cannot damage the LM's language
+                # ability in early training (counts training micro-batches).
+                # distill_warmup_steps=0 disables warmup (factor stays 1.0).
+                _warm = int(getattr(self.config, 'distill_warmup_steps', 0) or 0)
+                if _warm > 0 and self.training:
+                    if not hasattr(self, '_distill_step'):
+                        self._distill_step = 0
+                    self._distill_step += 1
+                    _factor = min(1.0, self._distill_step / float(_warm))
+                else:
+                    _factor = 1.0
+                loss = loss + distill_loss * _factor
 
         if not return_dict:
             output = (logits,) + outputs[1:]

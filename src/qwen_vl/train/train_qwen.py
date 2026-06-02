@@ -165,6 +165,8 @@ def train(attn_implementation="flash_attention_2"):
                 "depth_dim",
                 "geometry_weight",
                 "depth_weight",
+                "distill_warmup_steps",
+                "distill_max_frames",
             ]:
                 setattr(config, k, getattr(model_args, k))
 

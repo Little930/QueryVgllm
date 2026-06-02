@@ -10,3 +10,6 @@ checkpoints/
 node_modules/
 outputs/
 
+
+# Offline Docs
+offline_docs/
